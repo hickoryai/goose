@@ -94,6 +94,7 @@ impl CopilotAcpProvider {
                 session_config_options,
                 model_config_option_id: Some("model".to_string()),
                 mode_mapping,
+                terminal: false,
                 notification_callback: None,
             };
 

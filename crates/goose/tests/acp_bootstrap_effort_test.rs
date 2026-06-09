@@ -98,6 +98,7 @@ async fn bootstrap_config_option_response_refreshes_the_effort_mirror() {
         session_config_options: vec![("model".to_string(), "gpt-5".to_string())],
         model_config_option_id: Some("model".to_string()),
         mode_mapping: HashMap::new(),
+        terminal: false,
         notification_callback: None,
     };
 
@@ -182,6 +183,7 @@ async fn new_session_preserves_pre_response_effort_update() {
             session_config_options: vec![],
             model_config_option_id: None,
             mode_mapping: HashMap::new(),
+            terminal: false,
             notification_callback: None,
         },
         ByteStreams::new(client_write.compat_write(), client_read.compat()),
@@ -281,6 +283,7 @@ async fn loaded_session_refreshes_the_effort_mirror() {
         session_config_options: vec![],
         model_config_option_id: None,
         mode_mapping: HashMap::new(),
+        terminal: false,
         notification_callback: Some(Arc::new(move |notification| {
             if notification.session_id.0.as_ref() == "saved-session"
                 && matches!(notification.update, SessionUpdate::UsageUpdate(_))

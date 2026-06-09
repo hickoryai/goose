@@ -1,13 +1,16 @@
 use agent_client_protocol::schema::v1::{
     Annotations as AcpAnnotations, ClientCapabilities, CloseSessionRequest, ContentBlock,
-    ContentChunk, EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse,
+    ContentChunk, CreateTerminalRequest, CreateTerminalResponse, EnvVariable, HttpHeader,
+    ImageContent, InitializeRequest, InitializeResponse, KillTerminalRequest, KillTerminalResponse,
     LoadSessionRequest, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, Role as AcpRole, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
-    SessionConfigSelectOptions, SessionId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCallContent, ToolCallStatus, ToolKind,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, ReleaseTerminalRequest,
+    ReleaseTerminalResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, Role as AcpRole, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TerminalOutputRequest, TextContent,
+    ToolCallContent, ToolCallStatus, ToolKind, WaitForTerminalExitRequest,
+    WaitForTerminalExitResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectionTo};
@@ -33,6 +36,7 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
 use crate::acp::handoff::{build_handoff_context_memo, memo_token_budget, prompt_token_cost};
+use crate::acp::terminal::TerminalManager;
 use crate::acp::{map_permission_response, PermissionDecision};
 use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY};
@@ -72,6 +76,7 @@ pub struct AcpProviderConfig {
     /// whenever the active session model changes.
     pub model_config_option_id: Option<String>,
     pub mode_mapping: HashMap<GooseMode, Vec<String>>,
+    pub terminal: bool,
     pub notification_callback: Option<Arc<dyn Fn(SessionNotification) + Send + Sync>>,
 }
 
@@ -260,13 +265,15 @@ impl AcpEffortState {
 struct AcpSessionState {
     active_id: Arc<Mutex<Option<SessionId>>>,
     effort: AcpEffortState,
+    terminal: TerminalManager,
 }
 
 impl AcpSessionState {
-    fn new(effort: AcpEffortState) -> Self {
+    fn new(effort: AcpEffortState, terminal: TerminalManager) -> Self {
         Self {
             active_id: Arc::new(Mutex::new(None)),
             effort,
+            terminal,
         }
     }
 }
@@ -1200,7 +1207,9 @@ impl AcpClientLoop {
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
-        let session_state = AcpSessionState::new(effort);
+        let terminal_enabled = config.terminal;
+        let terminal_manager = TerminalManager::new(config.work_dir.clone());
+        let session_state = AcpSessionState::new(effort, terminal_manager.clone());
 
         Client
             .builder()
@@ -1212,6 +1221,7 @@ impl AcpClientLoop {
                     let pending_tool_updates = pending_tool_updates.clone();
                     let context_size = context_size.clone();
                     let session_state = session_state.clone();
+                    let terminal_manager = terminal_manager.clone();
                     async move |notification: SessionNotification, _cx| {
                         let is_active_session =
                             session_state.active_id.lock().is_ok_and(|active| {
@@ -1319,7 +1329,10 @@ impl AcpClientLoop {
                                         let content = if accumulated.content.is_empty() {
                                             None
                                         } else {
-                                            Some(accumulated.content)
+                                            Some(
+                                                terminal_manager
+                                                    .resolve_content(accumulated.content),
+                                            )
                                         };
                                         let _ = tx.try_send(AcpUpdate::ToolCallComplete {
                                             id,
@@ -1365,7 +1378,10 @@ impl AcpClientLoop {
                                         let content = if accumulated.content.is_empty() {
                                             None
                                         } else {
-                                            Some(accumulated.content)
+                                            Some(
+                                                terminal_manager
+                                                    .resolve_content(accumulated.content),
+                                            )
                                         };
                                         let _ = tx.try_send(AcpUpdate::ToolCallComplete {
                                             id,
@@ -1411,6 +1427,109 @@ impl AcpClientLoop {
                             RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled)
                         });
                         responder.respond(response)
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: CreateTerminalRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        match terminal_manager.create(request).await {
+                            Ok(id) => responder.respond(CreateTerminalResponse::new(id)),
+                            Err(error) => Err(agent_client_protocol::Error::internal_error()
+                                .data(error.to_string())),
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: TerminalOutputRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        match terminal_manager.output(
+                            request.session_id.0.as_ref(),
+                            request.terminal_id.0.as_ref(),
+                        ) {
+                            Some(response) => responder.respond(response),
+                            None => Err(agent_client_protocol::Error::internal_error()
+                                .data(format!("unknown terminal {}", request.terminal_id.0))),
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: WaitForTerminalExitRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        match terminal_manager
+                            .wait_for_exit(
+                                request.session_id.0.as_ref(),
+                                request.terminal_id.0.as_ref(),
+                            )
+                            .await
+                        {
+                            Some(status) => {
+                                responder.respond(WaitForTerminalExitResponse::new(status))
+                            }
+                            None => Err(agent_client_protocol::Error::internal_error()
+                                .data(format!("unknown terminal {}", request.terminal_id.0))),
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: KillTerminalRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        terminal_manager.kill(
+                            request.session_id.0.as_ref(),
+                            request.terminal_id.0.as_ref(),
+                        );
+                        responder.respond(KillTerminalResponse::new())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let terminal_manager = terminal_manager.clone();
+                    async move |request: ReleaseTerminalRequest, responder, _cx| {
+                        if !terminal_enabled {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::method_not_found(),
+                            );
+                        }
+                        terminal_manager
+                            .release(
+                                request.session_id.0.as_ref(),
+                                request.terminal_id.0.as_ref(),
+                            )
+                            .await;
+                        responder.respond(ReleaseTerminalResponse::new())
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -1533,7 +1652,7 @@ async fn handle_requests(
 ) -> Result<(), agent_client_protocol::Error> {
     let mut init_tx = Some(init_tx);
 
-    let client_capabilities = ClientCapabilities::new();
+    let client_capabilities = ClientCapabilities::new().terminal(config.terminal);
     let init_response: InitializeResponse = cx
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1).client_capabilities(client_capabilities),
@@ -1644,6 +1763,7 @@ async fn handle_requests(
                 log_undelivered(response_tx.send(result), AGENT_METHOD_NAMES.session_load);
             }
             ClientRequest::CloseSession { session_id } => {
+                session_state.terminal.close_session(session_id.0.as_ref());
                 if supports_close {
                     if let Err(error) = cx
                         .send_request(CloseSessionRequest::new(session_id.clone()))
@@ -1728,6 +1848,7 @@ async fn handle_requests(
 
     if supports_close && !supports_load {
         for session_id in session_ids {
+            session_state.terminal.close_session(session_id.0.as_ref());
             if let Err(e) = cx
                 .send_request(CloseSessionRequest::new(session_id.clone()))
                 .block_task()
@@ -3997,6 +4118,7 @@ mod tests {
             session_config_options: vec![],
             model_config_option_id: None,
             mode_mapping,
+            terminal: false,
             notification_callback: None,
         }
     }

@@ -98,6 +98,7 @@ impl ProviderDef for CodexAcpProvider {
                 session_config_options: vec![],
                 model_config_option_id: Some("model".to_string()),
                 mode_mapping,
+                terminal: false,
                 notification_callback: None,
             };
 

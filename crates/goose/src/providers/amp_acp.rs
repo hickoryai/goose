@@ -86,6 +86,7 @@ impl ProviderDef for AmpAcpProvider {
                 session_config_options: vec![],
                 model_config_option_id: None,
                 mode_mapping,
+                terminal: false,
                 notification_callback: None,
             };
 

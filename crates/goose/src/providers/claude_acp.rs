@@ -97,6 +97,7 @@ impl ProviderDef for ClaudeAcpProvider {
                 // via query.setModel, so forward the picker's selection.
                 model_config_option_id: Some("model".to_string()),
                 mode_mapping,
+                terminal: true,
                 notification_callback: None,
             };
 

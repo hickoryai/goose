@@ -760,6 +760,9 @@ pub trait Connection: Sized {
     type Session: Session;
 
     fn expected_session_id() -> Arc<dyn ExpectedSessionId>;
+    fn uses_terminal_fixture() -> bool {
+        true
+    }
     async fn new(config: TestConnectionConfig, openai: OpenAiFixture) -> Self;
     async fn new_session(&mut self) -> anyhow::Result<SessionData<Self::Session>>;
     async fn load_session(

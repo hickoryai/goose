@@ -142,6 +142,10 @@ impl Connection for AcpProviderConnection {
         Arc::new(IgnoreSessionId)
     }
 
+    fn uses_terminal_fixture() -> bool {
+        false
+    }
+
     async fn new(config: TestConnectionConfig, openai: OpenAiFixture) -> Self {
         let (data_root, temp_dir) = match config.data_root.as_os_str().is_empty() {
             true => {
@@ -192,6 +196,7 @@ impl Connection for AcpProviderConnection {
                     (mode, vec![mode.to_string()])
                 })
                 .collect(),
+            terminal: config.terminal.is_some(),
             notification_callback: Some(Arc::new(move |n| {
                 sink_clone.lock().unwrap().push(n.update.clone());
             })),

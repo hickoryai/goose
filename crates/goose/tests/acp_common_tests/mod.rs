@@ -1589,6 +1589,8 @@ pub async fn run_shell_terminal_true<C: Connection>() {
             Notification::AgentMessage,
         ],
     );
-    terminal.assert_called();
+    if C::uses_terminal_fixture() {
+        terminal.assert_called();
+    }
     expected_session_id.assert_matches(&session.session_id().0);
 }
