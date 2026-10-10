@@ -1,5 +1,26 @@
 # Goose Benchmark Scripts
 
+## Hickory dev workstation release
+
+Hickory dev workstations install a pinned Goose fork binary from GitHub
+Releases. They do not clone or compile Goose during an upgrade.
+
+After testing a pushed commit, publish its Linux x86-64 binary from a clean
+checkout:
+
+```bash
+scripts/release-dev-workstation.sh
+```
+
+The script uses the CLI feature profile tested by Kory Code. It excludes local
+inference, which keeps the workstation binary independent of libclang. The
+script creates `dev-workstation-<full-git-sha>` in `zaneclaes/goose`, uploads
+`goose-x86_64-unknown-linux-gnu.tar.gz`, and uploads its SHA-256 file.
+
+Re-running the script succeeds only when the existing release has the same
+checksum. Copy the printed revision and checksum into Hickory's Goose pin
+files. Keep source builds for development and testing.
+
 This directory contains scripts for running and analyzing Goose benchmarks.
 
 ## run-benchmarks.sh
