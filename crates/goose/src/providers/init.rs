@@ -29,6 +29,7 @@ use super::{
     nanogpt::NanoGptProvider,
     pi_acp::PiAcpProvider,
     provider_registry::ProviderRegistry,
+    router_acp::RouterAcpProvider,
     snowflake_def::SnowflakeProviderDef,
     tetrate::TetrateProvider,
     xai::XaiProvider,
@@ -173,6 +174,10 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
         registry.register_with_inventory::<PiAcpProvider>(
             false,
             Some(registrations::pi_acp_inventory()),
+        );
+        registry.register_with_inventory::<RouterAcpProvider>(
+            false,
+            Some(registrations::router_acp_inventory()),
         );
         #[cfg(feature = "aws-providers")]
         registry.register::<SageMakerTgiProvider>(false);

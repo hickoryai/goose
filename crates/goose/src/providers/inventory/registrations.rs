@@ -20,6 +20,7 @@ use crate::providers::muse_code_def;
 use crate::providers::ollama::OLLAMA_PROVIDER_NAME;
 use crate::providers::openai::{OPEN_AI_DEFAULT_BASE_PATH, OPEN_AI_PROVIDER_NAME};
 use crate::providers::pi_acp::{PI_ACP_BINARY, PI_ACP_PROVIDER_NAME};
+use crate::providers::router_acp::{ROUTER_ACP_BINARY, ROUTER_ACP_PROVIDER_NAME};
 use crate::providers::xai_oauth::TokenCache as XaiOAuthTokenCache;
 use goose_providers::azure_foundry::{endpoint_kind, EndpointKind, AZURE_FOUNDRY_PROVIDER_NAME};
 
@@ -262,6 +263,10 @@ pub fn copilot_acp_inventory() -> InventoryRegistration {
 
 pub fn pi_acp_inventory() -> InventoryRegistration {
     acp_inventory(PI_ACP_PROVIDER_NAME, PI_ACP_BINARY, true)
+}
+
+pub fn router_acp_inventory() -> InventoryRegistration {
+    acp_inventory(ROUTER_ACP_PROVIDER_NAME, ROUTER_ACP_BINARY, true)
 }
 
 #[cfg(test)]
