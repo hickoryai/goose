@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::{
     canonical::{
@@ -514,6 +514,17 @@ pub fn stream_from_single_message(message: Message, usage: ProviderUsage) -> Mes
     Box::pin(stream)
 }
 
+/// Output a provider's agent produced while goose had no prompt in flight — e.g. a turn the
+/// agent (or a router in front of it) started on its own after goose's turn ended.
+#[derive(Debug, Clone)]
+pub enum UnsolicitedUpdate {
+    /// One streamed piece, shaped like the messages `stream` yields: pieces that share an id
+    /// are chunks of one message.
+    Message(Message),
+    /// Everything sent so far is complete; later pieces never continue an earlier id.
+    Settled,
+}
+
 /// Base trait for AI providers (OpenAI, Anthropic, etc)
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -733,6 +744,12 @@ pub trait Provider: MaybeSend + MaybeSync {
     /// Subscribe to provider-managed thinking-effort capability changes.
     /// Providers without an asynchronous capability source return `None`.
     fn subscribe_thinking_effort_support(&self) -> Option<watch::Receiver<ThinkingEffortSupport>> {
+        None
+    }
+
+    /// Subscribe to output the agent produces outside any prompt goose sent. Providers whose
+    /// agent only ever speaks when prompted return `None`.
+    fn subscribe_unsolicited(&self) -> Option<broadcast::Receiver<UnsolicitedUpdate>> {
         None
     }
 
