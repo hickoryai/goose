@@ -92,11 +92,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ -z "${SKIP_BUILD:-}" && -z "${GOOSE_BIN:-}" ]]; then
   echo "Building goose..."
-  (cd "$REPO_ROOT" && cargo build --bin goose)
+  (cd "$REPO_ROOT" && cargo build --bin kory)
   echo ""
 fi
 
-GOOSE_BIN="${GOOSE_BIN:-$REPO_ROOT/target/debug/goose}"
+GOOSE_BIN="${GOOSE_BIN:-$REPO_ROOT/target/debug/kory}"
 if [[ ! -x "$GOOSE_BIN" ]]; then
   echo "Error: goose binary not found or not executable: $GOOSE_BIN"
   exit 1
@@ -258,7 +258,7 @@ for model in "${MODELS[@]}"; do
       echo "  $error_summary"
       RESULTS+=("✗ $model - $error_summary")
     else
-      RESULTS+=("✗ $model - goose run failed")
+      RESULTS+=("✗ $model - kory run failed")
     fi
     OVERALL_SUCCESS=false
   fi

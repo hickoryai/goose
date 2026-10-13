@@ -321,7 +321,7 @@ function InstallSection() {
             </div>
             <pre className={styles.terminalBody}>
               <code>
-{`curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash`}
+{`curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash`}
               </code>
             </pre>
           </div>

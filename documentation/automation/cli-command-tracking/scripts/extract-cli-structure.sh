@@ -32,7 +32,7 @@ download_release_binary() {
     echo "Downloading goose $version from GitHub releases..." >&2
     
     # Use the official download script with custom bin dir and specific version
-    curl -fsSL "https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh" | \
+    curl -fsSL "https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh" | \
         CONFIGURE=false GOOSE_BIN_DIR="$bin_dir" GOOSE_VERSION="$version" bash >&2 2>&1 || {
         echo "Error: Failed to download goose $version" >&2
         return 1
@@ -59,7 +59,7 @@ build_from_source() {
             echo "Error: Failed to build goose from HEAD" >&2
             return 1
         }
-        echo "$GOOSE_REPO/target/release/goose"
+        echo "$GOOSE_REPO/target/release/kory"
     else
         # Verify version exists
         if ! git rev-parse "$version" >/dev/null 2>&1; then
@@ -85,7 +85,7 @@ build_from_source() {
         }
         
         # Clean up worktree but keep the binary accessible
-        local bin_path="$worktree_dir/target/release/goose"
+        local bin_path="$worktree_dir/target/release/kory"
         local temp_bin="$TEMP_DIR/goose-$safe_version-bin"
         cp "$bin_path" "$temp_bin"
         

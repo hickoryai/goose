@@ -80,6 +80,7 @@ pub(crate) mod private_file;
 pub mod provider_registry;
 pub mod provider_secrets;
 pub mod provider_test;
+pub mod router_acp;
 mod retry {
     pub use goose_providers::retry::*;
 }

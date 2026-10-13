@@ -227,13 +227,13 @@ know to start it in a terminal. Make sure you include instructions on how to set
 
 ```bash
 # Python example
-goose session --with-extension "python server.py"
+kory session --with-extension "python server.py"
 
 # TypeScript example
-goose session --with-extension "node server.js"
+kory session --with-extension "node server.js"
 
 # Kotlin example
-goose session --with-extension "java -jar build/libs/extension.jar"
+kory session --with-extension "java -jar build/libs/extension.jar"
 ```
 
 Tell users to watch for startup errors. If the session fails to start, they should share the error message with you for debugging.
@@ -244,13 +244,13 @@ Ask the user if they want you to do that, and let them know they will manually n
 
 ```bash
 # Python example
-goose run --with-extension "python server.py" --text "EXAMPLE PROMPT HERE"
+kory run --with-extension "python server.py" --text "EXAMPLE PROMPT HERE"
 
 # TypeScript example
-goose run --with-extension "node server.js" --text "EXAMPLE PROMPT HERE"
+kory run --with-extension "node server.js" --text "EXAMPLE PROMPT HERE"
 
 # Kotlin example
-goose run --with-extension "java -jar build/libs/extension.jar" --text "EXAMPLE PROMPT HERE"
+kory run --with-extension "java -jar build/libs/extension.jar" --text "EXAMPLE PROMPT HERE"
 ```
 
 ### 2. Testing Tools and Resources

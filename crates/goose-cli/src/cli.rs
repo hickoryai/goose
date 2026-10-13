@@ -74,7 +74,7 @@ impl From<ServePlatform> for GoosePlatform {
 }
 
 #[derive(Parser)]
-#[command(name = "goose", author, version, display_name = "", about, long_about = None)]
+#[command(name = "kory", author, version, display_name = "", about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -902,11 +902,11 @@ enum Command {
         #[arg(long, help = "Enable scheduled recipe execution")]
         enable_scheduler: bool,
 
-        /// Also expose this server over goose roam (p2p) so paired devices can connect remotely
+        /// Also expose this server over kory roam (p2p) so paired devices can connect remotely
         #[cfg(feature = "roaming")]
         #[arg(
             long,
-            help = "Also expose this server over goose roam (p2p) so paired devices can connect remotely"
+            help = "Also expose this server over kory roam (p2p) so paired devices can connect remotely"
         )]
         roam: bool,
     },
@@ -1065,10 +1065,10 @@ enum Command {
         long_about = "Runs a goose session tied to your terminal window.\n\
                       Each terminal maintains its own persistent session that resumes automatically.\n\n\
                       Setup:\n  \
-                        eval \"$(goose term init zsh)\"  # zsh/bash\n  \
-                        let init = ($nu.cache-dir | path join \"goose-term-init.nu\"); ^goose term init nu | save --force $init; source $init\n\n\
+                        eval \"$(kory term init zsh)\"  # zsh/bash\n  \
+                        let init = ($nu.cache-dir | path join \"goose-term-init.nu\"); ^kory term init nu | save --force $init; source $init\n\n\
                       Usage:\n  \
-                        goose term run \"list files in this directory\"\n  \
+                        kory term run \"list files in this directory\"\n  \
                         @goose \"create a python script\"  # using alias\n  \
                         @g \"quick question\"  # short alias"
     )]
@@ -1093,7 +1093,7 @@ enum Command {
         #[arg(value_enum)]
         shell: CompletionShell,
 
-        #[arg(long, default_value = "goose", help = "Provide a custom binary name")]
+        #[arg(long, default_value = "kory", help = "Provide a custom binary name")]
         bin_name: String,
     },
 
@@ -1147,7 +1147,7 @@ enum Command {
         /// Disable the Rust-driven parallel orchestrator and fall back to
         /// the single-prompt path that asks the main agent to delegate
         /// each check via `delegate(...)`. The default
-        /// orchestrator dispatches one `goose run` subprocess per check
+        /// orchestrator dispatches one `kory run` subprocess per check
         /// (capped at 4 concurrent), bounding wall-clock to the slowest
         /// single check rather than waiting on the model to issue
         /// dispatches.
@@ -1285,15 +1285,15 @@ enum TermCommand {
         long_about = "Prints shell configuration to set up terminal-integrated sessions.\n\
                       Each terminal gets a persistent goose session that automatically resumes.\n\n\
                       Setup:\n  \
-                        echo 'eval \"$(goose term init zsh)\"' >> ~/.zshrc\n  \
+                        echo 'eval \"$(kory term init zsh)\"' >> ~/.zshrc\n  \
                         source ~/.zshrc\n\n\
                         Nushell:\n  \
                         let init = ($nu.cache-dir | path join \"goose-term-init.nu\")\n  \
-                        ^goose term init nu | save --force $init\n  \
+                        ^kory term init nu | save --force $init\n  \
                         source $init\n\n\
                       With --default (anything typed that isn't a command goes to goose):\n  \
-                        echo 'eval \"$(goose term init zsh --default)\"' >> ~/.zshrc\n  \
-                        ^goose term init nu --default | save --force $init"
+                        echo 'eval \"$(kory term init zsh --default)\"' >> ~/.zshrc\n  \
+                        ^kory term init nu --default | save --force $init"
     )]
     Init {
         /// Shell type (bash, zsh, fish, nu, powershell)
@@ -1324,7 +1324,7 @@ enum TermCommand {
         about = "Run a prompt in the terminal session",
         long_about = "Run a prompt in the terminal-integrated session.\n\n\
                       Examples:\n  \
-                        goose term run list files in this directory\n  \
+                        kory term run list files in this directory\n  \
                         @goose list files  # using alias\n  \
                         @g why did that fail  # short alias"
     )]
@@ -1718,7 +1718,7 @@ async fn start_roam_share(
     .await?;
 
     let agent_id = node.endpoint_id().to_string();
-    // Roaming sessions run where `goose serve` was started: the connector's
+    // Roaming sessions run where `kory serve` was started: the connector's
     // machine-local path is meaningless on this host, and the serve-wide
     // server keeps `session_cwd: None` for local ACP clients.
     let session_cwd =
@@ -1815,7 +1815,7 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
     let require_token = env_secret.is_some();
     if !require_token && !dangerously_unauthenticated {
         anyhow::bail!(
-            "{GOOSE_SERVER_SECRET_KEY_ENV} must be set to start `goose serve`; pass --dangerously-unauthenticated to run without ACP authentication"
+            "{GOOSE_SERVER_SECRET_KEY_ENV} must be set to start `kory serve`; pass --dangerously-unauthenticated to run without ACP authentication"
         );
     }
     if dangerously_unauthenticated && !require_token {
@@ -2188,7 +2188,7 @@ fn parse_run_input(
         (Some(file), _, _) => {
             let contents = std::fs::read_to_string(file).unwrap_or_else(|err| {
                 eprintln!(
-                    "Instruction file not found — did you mean to use goose run --text?\n{}",
+                    "Instruction file not found — did you mean to use kory run --text?\n{}",
                     err
                 );
                 std::process::exit(1);
@@ -2662,7 +2662,7 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
                         format_size(variant.size_bytes)
                     );
                     println!(
-                        "    Download: goose local-models download '{}'",
+                        "    Download: kory local-models download '{}'",
                         variant.download_id
                     );
                 } else {
@@ -2693,7 +2693,7 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
                     );
                     if variant.supported {
                         println!(
-                            "    Download: goose local-models download '{}'",
+                            "    Download: kory local-models download '{}'",
                             variant.download_id
                         );
                     }
@@ -2985,7 +2985,7 @@ mod tests {
 
     #[test]
     fn completion_command_accepts_nushell_alias() {
-        let cli = Cli::try_parse_from(["goose", "completion", "nushell"]).expect("parse failed");
+        let cli = Cli::try_parse_from(["kory", "completion", "nushell"]).expect("parse failed");
 
         match cli.command {
             Some(Command::Completion {
@@ -2999,7 +2999,7 @@ mod tests {
     #[test]
     fn session_resume_accepts_provider_and_model_overrides() {
         let cli = Cli::try_parse_from([
-            "goose",
+            "kory",
             "session",
             "--resume",
             "--provider",
@@ -3023,7 +3023,7 @@ mod tests {
 
     #[test]
     fn session_accepts_provider_override_without_resume() {
-        let cli = Cli::try_parse_from(["goose", "session", "--provider", "openai"])
+        let cli = Cli::try_parse_from(["kory", "session", "--provider", "openai"])
             .expect("provider override should work for a new session");
 
         match cli.command {
@@ -3039,7 +3039,7 @@ mod tests {
 
     #[test]
     fn session_accepts_model_override_without_resume() {
-        let cli = Cli::try_parse_from(["goose", "session", "--model", "gpt-5.4"])
+        let cli = Cli::try_parse_from(["kory", "session", "--model", "gpt-5.4"])
             .expect("model override should work for a new session");
 
         match cli.command {
@@ -3055,7 +3055,7 @@ mod tests {
 
     #[test]
     fn session_accepts_system_prompt() {
-        let cli = Cli::try_parse_from(["goose", "session", "--system", "extra instructions"])
+        let cli = Cli::try_parse_from(["kory", "session", "--system", "extra instructions"])
             .expect("system prompt should work for a new session");
 
         match cli.command {
@@ -3071,11 +3071,11 @@ mod tests {
         let mut cmd = Cli::command();
         let mut buffer = Vec::new();
 
-        CompletionShell::Nu.generate(&mut cmd, "goose", &mut buffer);
+        CompletionShell::Nu.generate(&mut cmd, "kory", &mut buffer);
 
         let script = String::from_utf8(buffer).expect("utf8");
         assert!(script.contains("module completions"));
-        assert!(script.contains("export extern goose"));
+        assert!(script.contains("export extern kory"));
         assert!(script.contains("export use completions *"));
     }
 
@@ -3089,7 +3089,7 @@ mod tests {
         init.write_long_help(&mut buffer).expect("write help");
 
         let help = String::from_utf8(buffer).expect("utf8");
-        assert!(help.contains("goose term init nu"));
+        assert!(help.contains("kory term init nu"));
         assert!(help.contains("Supported for zsh, bash, and nu"));
     }
 
@@ -3109,7 +3109,7 @@ mod tests {
 
     #[test]
     fn skills_command_accepts_list_subcommand() {
-        let cli = Cli::try_parse_from(["goose", "skills", "list"]).expect("parse failed");
+        let cli = Cli::try_parse_from(["kory", "skills", "list"]).expect("parse failed");
 
         match cli.command {
             Some(Command::Skills {
@@ -3123,7 +3123,7 @@ mod tests {
     #[test]
     fn serve_command_accepts_dangerously_unauthenticated_flag() {
         let cli = Cli::try_parse_from([
-            "goose",
+            "kory",
             "serve",
             "--dangerously-unauthenticated",
             "--allowed-origin",
@@ -3152,7 +3152,7 @@ mod tests {
     #[test]
     fn review_command_accepts_options() {
         let cli = Cli::try_parse_from([
-            "goose",
+            "kory",
             "review",
             "origin/main...HEAD",
             "--prompt",

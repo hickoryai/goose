@@ -20,9 +20,9 @@
     "x64"
   ],
   "bin": {
-    "goose-binary-darwin-x64": "./bin/goose"
+    "goose-binary-darwin-x64": "./bin/kory"
   },
   "files": [
-    "bin/goose"
+    "bin/kory"
   ]
 }

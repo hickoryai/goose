@@ -103,15 +103,15 @@ echo "" >> "$SUMMARY_FILE"
 # Determine which binary to use
 GOOSE_CMD="goose"
 if [ "$DEBUG_MODE" = true ]; then
-  if [ -f "./target/debug/goose" ]; then
-    GOOSE_CMD="./target/debug/goose"
+  if [ -f "./target/debug/kory" ]; then
+    GOOSE_CMD="./target/debug/kory"
     echo "Using debug binary: $GOOSE_CMD"
   else
     echo "Warning: Debug binary not found at ./target/debug/goose. Falling back to system-installed goose."
   fi
 else
-  if [ -f "./target/release/goose" ]; then
-    GOOSE_CMD="./target/release/goose"
+  if [ -f "./target/release/kory" ]; then
+    GOOSE_CMD="./target/release/kory"
     echo "Using release binary: $GOOSE_CMD"
   else
     echo "Warning: Release binary not found at ./target/release/goose. Falling back to system-installed goose."

@@ -1,4 +1,4 @@
-//! `goose review` — local code review tool.
+//! `kory review` — local code review tool.
 //!
 //! Discovers `**/.agents/checks/*.md` subagent reviewers and `**/.agents/REVIEW.md`
 //! scoped prompt overrides, builds a review request from the working tree (or an

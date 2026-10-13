@@ -33,14 +33,14 @@ The `download_cli.sh` installer detects Termux and automatically selects the
 musl portable build (`GOOSE_LINUX_VARIANT=musl`). To install:
 
 ```bash
-curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash
 ```
 
 To build from source in Termux:
 
 ```bash
 pkg install rust cmake protobuf clang build-essential
-cargo build --release -p goose-cli --bin goose --no-default-features --features portable-default
+cargo build --release -p goose-cli --bin kory --no-default-features --features portable-default
 ```
 
 > **Note:** The musl/portable build disables `local-inference` (V8) and
@@ -68,7 +68,7 @@ cd goose
 Build Goose CLI:
 
 ```bash
-cargo build --release -p goose-cli --bin goose
+cargo build --release -p goose-cli --bin kory
 ```
 
 This command should give you a list of possible packages in the
@@ -85,7 +85,7 @@ pnpm install
 
 # Copy the goose binary to the expected location
 mkdir -p src/bin
-cp ../../target/release/goose src/bin/
+cp ../../target/release/kory src/bin/
 ```
 
 ### 4. Build the Application
@@ -148,8 +148,8 @@ cd /path/to/goose/ui/desktop/out/goose-linux-x64
 
 #### Goose Binary Not Found
 If you see "Goose binary not found", ensure you've:
-1. Built the Rust binary: `cargo build --release -p goose-cli --bin goose`
-2. Copied it to the right location: `cp ../../target/release/goose src/bin/`
+1. Built the Rust binary: `cargo build --release -p goose-cli --bin kory`
+2. Copied it to the right location: `cp ../../target/release/kory src/bin/`
 3. Rebuilt the application: `pnpm run make`
 
 ### Distribution-Specific Notes
@@ -180,7 +180,7 @@ Building as Snap packages is not currently supported but may be added in the fut
 
 For active development:
 
-1. **Backend changes**: Rebuild with `cargo build --release -p goose-cli --bin goose` and copy the binary
+1. **Backend changes**: Rebuild with `cargo build --release -p goose-cli --bin kory` and copy the binary
 2. **Frontend changes**: Use `pnpm run start` for hot reload during development
 3. **Full rebuild**: Run the complete build process above
 

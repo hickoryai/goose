@@ -316,7 +316,7 @@ def extract_version(binary_path: str) -> str:
 def main():
     if len(sys.argv) < 2:
         print("Usage: extract-cli-structure.py <goose-binary-path> [source-version]", file=sys.stderr)
-        print("Example: extract-cli-structure.py /usr/local/bin/goose v1.15.0", file=sys.stderr)
+        print("Example: extract-cli-structure.py /usr/local/bin/kory v1.15.0", file=sys.stderr)
         sys.exit(1)
     
     binary_path = sys.argv[1]

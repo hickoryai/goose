@@ -1,11 +1,11 @@
 //! ACP Client Example
 //!
-//! Spawns `goose acp` as a child process and sends it a completion request
+//! Spawns `kory acp` as a child process and sends it a completion request
 //! using the Agent Client Protocol over stdio.
 //!
 //! # Prerequisites
 //!
-//! You must have goose built and a provider configured (`goose configure`).
+//! You must have goose built and a provider configured (`kory configure`).
 //!
 //! # Usage
 //!
@@ -16,7 +16,7 @@
 //! Or with a custom goose binary path:
 //!
 //! ```bash
-//! cargo run -p goose-sdk --example acp_client -- --goose-bin ./target/debug/goose "Explain Rust's ownership model in one sentence"
+//! cargo run -p goose-sdk --example acp_client -- --goose-bin ./target/debug/kory "Explain Rust's ownership model in one sentence"
 //! ```
 
 use agent_client_protocol::schema::v1::{

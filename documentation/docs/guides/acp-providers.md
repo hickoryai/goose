@@ -59,6 +59,14 @@ Wraps `pi-acp`, an ACP adapter for Pi. Uses your existing Pi installation.
 - ACP adapter installed (`pi-acp` binary available)
 - Authenticated with your Pi account (`pi` CLI working)
 
+### Router ACP
+
+Runs [router-acp](https://github.com/zaneclaes/router-acp), which routes each session across the agents and models in its configuration. goose starts `router-acp serve` itself, so no `pi-acp` shim is needed.
+
+**Requirements:**
+- `router-acp` binary installed and in your PATH
+- A router configuration with connected provider accounts (default `~/.config/router-acp/router.yaml`)
+
 ## Setup Instructions
 
 ### Amp ACP
@@ -198,6 +206,24 @@ Replacing the npm package does not change `~/.codex` or require recreating your 
 
    Or configure through the goose CLI using `goose configure`.
 
+### Router ACP
+
+1. **Install router-acp and connect its accounts**
+
+   Install the `router-acp` binary and connect the provider accounts your router configuration uses.
+
+2. **Configure goose**
+
+   ```bash
+   export GOOSE_PROVIDER=router-acp
+   # Only needed when your configuration is not at ~/.config/router-acp/router.yaml
+   export ROUTER_ACP_CONFIG=/path/to/router.yaml
+   ```
+
+   Or configure through the goose CLI using `kory configure`.
+
+   If you previously pointed the `pi-acp` provider at a shim that runs `router-acp serve`, switch `GOOSE_PROVIDER` to `router-acp` and remove the shim.
+
 ## Usage Examples
 
 ### Basic Usage
@@ -285,11 +311,22 @@ See [codex-acp](https://github.com/agentclientprotocol/codex-acp) for session mo
 | `GOOSE_MODEL`        | Model to use     | `current` |
 | `GOOSE_MODE`         | Permission mode  | `auto`    |
 
+### Router ACP Configuration
+
+| Environment Variable | Description                    | Default                           |
+|----------------------|--------------------------------|-----------------------------------|
+| `GOOSE_PROVIDER`     | Set to `router-acp`            | None                              |
+| `ROUTER_ACP_CONFIG`  | Path to the router-acp config  | `~/.config/router-acp/router.yaml` |
+| `GOOSE_MODEL`        | Model to use                   | `current`                         |
+| `GOOSE_MODE`         | Permission mode                | `auto`                            |
+
+Keep `current` to let router-acp choose the agent and model for each session.
+
 ## Error Handling
 
 ACP providers depend on external binaries, so ensure:
 
-- The ACP agent binary is installed and in your PATH (`amp-acp`, `claude-agent-acp`, `codex-acp`, `pi-acp`, or `copilot`)
+- The ACP agent binary is installed and in your PATH (`amp-acp`, `claude-agent-acp`, `codex-acp`, `pi-acp`, `router-acp`, or `copilot`)
 - The underlying CLI tool is authenticated and working
 - Subscription limits are not exceeded
 - Node.js and npm are installed (for npm-distributed adapters)

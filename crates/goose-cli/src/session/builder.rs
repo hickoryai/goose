@@ -305,7 +305,7 @@ async fn resolve_provider_and_model(
         .or_else(|| recipe_settings.and_then(|s| s.goose_provider.clone()))
         .or_else(|| configured_provider.clone())
         .unwrap_or_else(|| {
-            output::render_error("No provider configured. Run 'goose configure' first.");
+            output::render_error("No provider configured. Run 'kory configure' first.");
             process::exit(1);
         });
 
@@ -400,7 +400,7 @@ async fn resolve_provider_and_model(
             }
         })
         .unwrap_or_else(|| {
-            output::render_error("No model configured. Run 'goose configure' first.");
+            output::render_error("No model configured. Run 'kory configure' first.");
             process::exit(1);
         });
 
@@ -738,11 +738,11 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
                     && is_provider_unavailable_error(&e) =>
             {
                 let fallback_provider = config.get_goose_provider().unwrap_or_else(|_| {
-                    output::render_error("No provider configured. Run 'goose configure' first.");
+                    output::render_error("No provider configured. Run 'kory configure' first.");
                     process::exit(1);
                 });
                 let fallback_model = config.get_goose_model().unwrap_or_else(|_| {
-                    output::render_error("No model configured. Run 'goose configure' first.");
+                    output::render_error("No model configured. Run 'kory configure' first.");
                     process::exit(1);
                 });
                 eprintln!(
@@ -776,7 +776,7 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
                     Err(e2) => {
                         output::render_error(&format!(
                         "Error {}.\n\
-                        Please check your system keychain and run 'goose configure' again.\n\
+                        Please check your system keychain and run 'kory configure' again.\n\
                         If your system is unable to use the keyring, please try setting secret key(s) via environment variables.\n\
                         For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors",
                         e2
@@ -788,7 +788,7 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
             Err(e) => {
                 output::render_error(&format!(
                 "Error {}.\n\
-                Please check your system keychain and run 'goose configure' again.\n\
+                Please check your system keychain and run 'kory configure' again.\n\
                 If your system is unable to use the keyring, please try setting secret key(s) via environment variables.\n\
                 For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors",
                 e

@@ -27,7 +27,7 @@ describe('startup diagnostics', () => {
     const trace = createGooseServeStartupDiagnostics(diagnosticsDir, '/tmp/project');
 
     expect(trace).not.toBeNull();
-    trace!.diagnostics.binaryPath = '/bin/goose';
+    trace!.diagnostics.binaryPath = '/bin/kory';
     trace!.diagnostics.httpBaseUrl = 'http://127.0.0.1:3000';
     trace!.diagnostics.readinessUrl = 'http://127.0.0.1:3000/status';
     trace!.diagnostics.statusUrl = 'http://127.0.0.1:3000/status';
@@ -43,7 +43,7 @@ describe('startup diagnostics', () => {
     expect(path.basename(trace!.diagnosticsPath)).toMatch(/^goose-serve-startup-.*\.json$/);
     const saved = JSON.parse(fs.readFileSync(trace!.diagnosticsPath, 'utf8'));
     expect(saved).toMatchObject({
-      binaryPath: '/bin/goose',
+      binaryPath: '/bin/kory',
       httpBaseUrl: 'http://127.0.0.1:3000',
       readinessUrl: 'http://127.0.0.1:3000/status',
       statusUrl: 'http://127.0.0.1:3000/status',

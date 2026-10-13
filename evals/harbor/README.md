@@ -218,8 +218,8 @@ The remote argument is `user@host:/path/to/goose` — `pull` appends
 # Run two configurations on the remote (in screen / mosh / tmux)
 ssh tbench@douwe.com
 cd /home/tbench/work/goose
-./evals/harbor/cmd.py run ./target/release/goose --job-name baseline
-./evals/harbor/cmd.py run ./target/release/goose \
+./evals/harbor/cmd.py run ./target/release/kory --job-name baseline
+./evals/harbor/cmd.py run ./target/release/kory \
   --extensions developer,todo,codemode --job-name codemode
 
 # Pull results locally

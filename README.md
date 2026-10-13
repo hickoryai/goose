@@ -35,7 +35,7 @@ goose is part of the [Agentic AI Foundation (AAIF)](https://aaif.io/) at the Lin
 Or install the CLI:
 
 ```bash
-curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash
 ```
 
 # Quick links

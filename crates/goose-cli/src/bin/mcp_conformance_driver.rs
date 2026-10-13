@@ -100,7 +100,7 @@ fn main() {
     let scenario = std::env::var("MCP_CONFORMANCE_SCENARIO").ok();
     let script = script_for_scenario(scenario.as_deref());
 
-    let goose = std::env::var("GOOSE_BIN").unwrap_or_else(|_| "target/debug/goose".to_string());
+    let goose = std::env::var("GOOSE_BIN").unwrap_or_else(|_| "target/debug/kory".to_string());
     let path_root = tempfile::Builder::new()
         .prefix("goose-mcp-conformance-")
         .tempdir()

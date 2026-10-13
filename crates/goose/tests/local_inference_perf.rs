@@ -2,7 +2,7 @@
 //!
 //! These tests require a downloaded GGUF model and are ignored by default.
 //! Download a model first:
-//!   goose local-models download bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M
+//!   kory local-models download bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M
 //!
 //! Run with the default model:
 //!   cargo test -p goose --test local_inference_perf -- --ignored --nocapture

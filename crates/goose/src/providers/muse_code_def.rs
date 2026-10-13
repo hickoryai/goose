@@ -585,7 +585,7 @@ impl ProviderDescriptor for MuseCodeProviderDef {
             ],
         )
         .with_setup_steps(vec![
-            "Run `goose configure` and select 'Meta Muse Code'",
+            "Run `kory configure` and select 'Meta Muse Code'",
             "A browser window will open — sign in to Meta and confirm the displayed code",
             "Once authorized, Goose will save your token automatically",
         ])

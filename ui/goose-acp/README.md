@@ -13,15 +13,15 @@ npm install @aaif/goose-acp
 
 The matching `@aaif/goose-binary-*` package is installed automatically. Do not
 install a platform package directly; `@aaif/goose-acp` provides the supported
-`goose` command.
+`kory` command.
 
 ## Usage
 
 Run the Goose CLI installed by the package:
 
 ```bash
-npx goose acp
-npx goose serve
+npx kory acp
+npx kory serve
 ```
 
 The launcher forwards arguments and standard input, output, and error streams to
@@ -43,11 +43,11 @@ cases it verifies that the executable exists and returns an absolute path.
 Use the override to run a locally built or custom Goose executable:
 
 ```bash
-GOOSE_BINARY=/path/to/goose npx goose acp
+GOOSE_BINARY=/path/to/kory npx kory acp
 ```
 
 `GOOSE_BINARY` must point directly to a native Goose executable, not a
-`node_modules/.bin/goose` command shim.
+`node_modules/.bin/kory` command shim.
 
 Supported platforms:
 

@@ -8,11 +8,11 @@ import * as publicApi from "../dist/index.js";
 import { resolveGooseBinaryForRuntime } from "../dist/resolve-binary.js";
 
 const supportedPlatforms = [
-  ["darwin", "arm64", "@aaif/goose-binary-darwin-arm64", "goose"],
-  ["darwin", "x64", "@aaif/goose-binary-darwin-x64", "goose"],
-  ["linux", "arm64", "@aaif/goose-binary-linux-arm64", "goose"],
-  ["linux", "x64", "@aaif/goose-binary-linux-x64", "goose"],
-  ["win32", "x64", "@aaif/goose-binary-win32-x64", "goose.exe"],
+  ["darwin", "arm64", "@aaif/goose-binary-darwin-arm64", "kory"],
+  ["darwin", "x64", "@aaif/goose-binary-darwin-x64", "kory"],
+  ["linux", "arm64", "@aaif/goose-binary-linux-arm64", "kory"],
+  ["linux", "x64", "@aaif/goose-binary-linux-x64", "kory"],
+  ["win32", "x64", "@aaif/goose-binary-win32-x64", "kory.exe"],
 ];
 
 function setGooseBinary(t, value) {
@@ -62,7 +62,7 @@ test("exports only the public resolver from the package root", () => {
 
 test("uses GOOSE_BINARY as an explicit override", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "goose-acp-override-"));
-  const binaryPath = join(directory, "goose");
+  const binaryPath = join(directory, "kory");
   writeFileSync(binaryPath, "");
   setGooseBinary(t, relative(process.cwd(), binaryPath));
 

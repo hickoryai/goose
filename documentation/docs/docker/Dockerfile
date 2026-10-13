@@ -90,7 +90,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN curl -Ls https://sh.jbang.dev | bash -s - app setup
 
 # Copy the built binaries
-COPY --from=builder /usr/src/goose/target/release/goose /usr/local/bin/
+COPY --from=builder /usr/src/goose/target/release/kory /usr/local/bin/
 
 # Create a wrapper script to initialize DBus and keyring
 RUN echo '#!/bin/bash\n\

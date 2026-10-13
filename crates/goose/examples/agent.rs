@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = ExtensionConfig::stdio(
         "developer",
-        "./target/debug/goose",
+        "./target/debug/kory",
         DEFAULT_EXTENSION_DESCRIPTION,
         DEFAULT_EXTENSION_TIMEOUT,
     )

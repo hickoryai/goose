@@ -24,41 +24,41 @@ use std::process::Command;
 fn asset_name() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        "goose-aarch64-apple-darwin.tar.bz2"
+        "kory-aarch64-apple-darwin.tar.bz2"
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        "goose-x86_64-apple-darwin.tar.bz2"
+        "kory-x86_64-apple-darwin.tar.bz2"
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
     {
-        "goose-x86_64-unknown-linux-gnu.tar.bz2"
+        "kory-x86_64-unknown-linux-gnu.tar.bz2"
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))]
     {
-        "goose-aarch64-unknown-linux-gnu.tar.bz2"
+        "kory-aarch64-unknown-linux-gnu.tar.bz2"
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "musl"))]
     {
-        "goose-x86_64-unknown-linux-musl.tar.bz2"
+        "kory-x86_64-unknown-linux-musl.tar.bz2"
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "musl"))]
     {
-        "goose-aarch64-unknown-linux-musl.tar.bz2"
+        "kory-aarch64-unknown-linux-musl.tar.bz2"
     }
     // RISC-V builds compile with this asset name, but update() rejects the
     // platform until release artifacts are published. See update() below.
     #[cfg(all(target_os = "linux", target_arch = "riscv64", target_env = "gnu"))]
     {
-        "goose-riscv64gc-unknown-linux-gnu.tar.bz2"
+        "kory-riscv64gc-unknown-linux-gnu.tar.bz2"
     }
     #[cfg(all(target_os = "windows", target_arch = "x86_64", feature = "cuda"))]
     {
-        "goose-x86_64-pc-windows-msvc-cuda.zip"
+        "kory-x86_64-pc-windows-msvc-cuda.zip"
     }
     #[cfg(all(target_os = "windows", target_arch = "x86_64", not(feature = "cuda")))]
     {
-        "goose-x86_64-pc-windows-msvc.zip"
+        "kory-x86_64-pc-windows-msvc.zip"
     }
 }
 
@@ -66,11 +66,11 @@ fn asset_name() -> &'static str {
 fn binary_name() -> &'static str {
     #[cfg(target_os = "windows")]
     {
-        "goose.exe"
+        "kory.exe"
     }
     #[cfg(not(target_os = "windows"))]
     {
-        "goose"
+        "kory"
     }
 }
 
@@ -128,7 +128,7 @@ fn should_retry_attestations_without_token(status: StatusCode, token: Option<&st
 
 async fn fetch_attestations(digest: &str, token: Option<&str>) -> Result<Vec<serde_json::Value>> {
     let url = format!(
-        "https://api.github.com/repos/aaif-goose/goose/attestations/sha256:{digest}\
+        "https://api.github.com/repos/hickoryai/goose/attestations/sha256:{digest}\
          ?per_page=30&predicate_type=https://slsa.dev/provenance/v1"
     );
 
@@ -322,7 +322,7 @@ pub async fn update(canary: bool, reconfigure: bool) -> Result<()> {
     {
         let tag = if canary { "canary" } else { "stable" };
         let asset = asset_name();
-        let url = format!("https://github.com/aaif-goose/goose/releases/download/{tag}/{asset}");
+        let url = format!("https://github.com/hickoryai/goose/releases/download/{tag}/{asset}");
 
         println!("Downloading {asset} from {tag} release...");
 
@@ -374,17 +374,17 @@ pub async fn update(canary: bool, reconfigure: bool) -> Result<()> {
         #[cfg(target_os = "windows")]
         copy_dlls(&extracted_binary, &current_exe)?;
 
-        println!("goose updated successfully (verified with Sigstore SLSA provenance).");
+        println!("kory updated successfully (verified with Sigstore SLSA provenance).");
 
         // --- Reconfigure if requested -------------------------------------------
         if reconfigure {
-            println!("Running goose configure...");
+            println!("Running kory configure...");
             let status = Command::new(current_exe)
                 .arg("configure")
                 .status()
-                .context("Failed to run goose configure")?;
+                .context("Failed to run kory configure")?;
             if !status.success() {
-                eprintln!("Warning: goose configure exited with {status}");
+                eprintln!("Warning: kory configure exited with {status}");
             }
         }
 
@@ -494,12 +494,12 @@ fn extract_tar_bz2(data: &[u8], dest: &Path) -> Result<()> {
 /// Find the binary inside the extracted archive.
 ///
 /// The archive may place it in:
-///   1. A `goose-package/` subdirectory (Windows releases)
+///   1. A `kory-package/` subdirectory (Windows releases)
 ///   2. Directly at the top level
 ///   3. In some other single subdirectory
 fn find_binary(extract_dir: &Path, binary_name: &str) -> Option<PathBuf> {
-    // 1. Check goose-package subdir (matches download_cli.sh / download_cli.ps1)
-    let package_dir = extract_dir.join("goose-package");
+    // 1. Check kory-package subdir (matches download_cli.sh / download_cli.ps1)
+    let package_dir = extract_dir.join("kory-package");
     if package_dir.is_dir() {
         let p = package_dir.join(binary_name);
         if p.exists() {
@@ -654,7 +654,7 @@ mod tests {
     fn test_asset_name_valid() {
         let name = asset_name();
         assert!(!name.is_empty());
-        assert!(name.starts_with("goose-"));
+        assert!(name.starts_with("kory-"));
         #[cfg(target_os = "windows")]
         assert!(name.ends_with(".zip"));
         #[cfg(not(target_os = "windows"))]
@@ -665,15 +665,15 @@ mod tests {
     fn test_binary_name() {
         let name = binary_name();
         #[cfg(target_os = "windows")]
-        assert_eq!(name, "goose.exe");
+        assert_eq!(name, "kory.exe");
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(name, "goose");
+        assert_eq!(name, "kory");
     }
 
     #[test]
     fn test_find_binary_in_package_subdir() {
         let tmp = tempdir().unwrap();
-        let pkg = tmp.path().join("goose-package");
+        let pkg = tmp.path().join("kory-package");
         fs::create_dir_all(&pkg).unwrap();
         fs::write(pkg.join(binary_name()), b"fake").unwrap();
 
@@ -729,8 +729,8 @@ mod tests {
     #[test]
     fn test_replace_binary_windows_rename_away() {
         let tmp = tempdir().unwrap();
-        let current = tmp.path().join("goose.exe");
-        let new_bin = tmp.path().join("new_goose.exe");
+        let current = tmp.path().join("kory.exe");
+        let new_bin = tmp.path().join("new_kory.exe");
 
         fs::write(&current, b"old version").unwrap();
         fs::write(&new_bin, b"new version").unwrap();
@@ -752,9 +752,9 @@ mod tests {
     #[test]
     fn test_replace_binary_windows_cleanup_old() {
         let tmp = tempdir().unwrap();
-        let current = tmp.path().join("goose.exe");
+        let current = tmp.path().join("kory.exe");
         let old = current.with_extension("exe.old");
-        let new_bin = tmp.path().join("new_goose.exe");
+        let new_bin = tmp.path().join("new_kory.exe");
 
         // Simulate a previous update left .old behind
         fs::write(&current, b"version 2").unwrap();
@@ -779,7 +779,7 @@ mod tests {
 
         let tmp = tempdir().unwrap();
 
-        // Create a zip in memory with goose-package/ structure
+        // Create a zip in memory with kory-package/ structure
         let mut buf = Vec::new();
         {
             let cursor = Cursor::new(&mut buf);
@@ -787,13 +787,11 @@ mod tests {
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
 
-            writer.add_directory("goose-package/", options).unwrap();
-            writer
-                .start_file("goose-package/goose.exe", options)
-                .unwrap();
+            writer.add_directory("kory-package/", options).unwrap();
+            writer.start_file("kory-package/kory.exe", options).unwrap();
             writer.write_all(b"fake goose binary").unwrap();
             writer
-                .start_file("goose-package/libtest.dll", options)
+                .start_file("kory-package/libtest.dll", options)
                 .unwrap();
             writer.write_all(b"fake dll").unwrap();
             writer.finish().unwrap();
@@ -801,14 +799,14 @@ mod tests {
 
         extract_zip(&buf, tmp.path()).unwrap();
 
-        let binary = find_binary(tmp.path(), "goose.exe");
+        let binary = find_binary(tmp.path(), "kory.exe");
         assert!(binary.is_some());
 
         let content = fs::read_to_string(binary.unwrap()).unwrap();
         assert_eq!(content, "fake goose binary");
 
-        // DLL should be in goose-package too
-        assert!(tmp.path().join("goose-package/libtest.dll").exists());
+        // DLL should be in kory-package too
+        assert!(tmp.path().join("kory-package/libtest.dll").exists());
     }
 
     // -----------------------------------------------------------------------
@@ -932,7 +930,7 @@ mod tests {
     #[test]
     fn test_validate_entry_path_accepts_safe_paths() {
         assert!(validate_entry_path(Path::new("goose")).is_ok());
-        assert!(validate_entry_path(Path::new("goose-package/goose")).is_ok());
+        assert!(validate_entry_path(Path::new("kory-package/kory")).is_ok());
         assert!(validate_entry_path(Path::new("subdir/nested/file.txt")).is_ok());
     }
 
@@ -976,14 +974,14 @@ mod tests {
             header.set_mode(0o755);
             header.set_cksum();
             builder
-                .append_data(&mut header, "goose-package/goose", &data[..])
+                .append_data(&mut header, "kory-package/kory", &data[..])
                 .unwrap();
             builder.into_inner().unwrap().finish().unwrap();
         }
 
         extract_tar_bz2(&builder_buf, tmp.path()).unwrap();
 
-        let extracted = tmp.path().join("goose-package/goose");
+        let extracted = tmp.path().join("kory-package/kory");
         assert!(extracted.exists());
         assert_eq!(
             fs::read_to_string(extracted).unwrap(),
