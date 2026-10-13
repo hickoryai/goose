@@ -334,12 +334,12 @@ pub async fn handle_schedule_cron_help() -> Result<()> {
 
     println!("💡 EXAMPLES:");
     println!(
-        "  goose schedule add --schedule-id hourly-report --cron \"0 * * * *\" --recipe-source report.yaml"
+        "  kory schedule add --schedule-id hourly-report --cron \"0 * * * *\" --recipe-source report.yaml"
     );
     println!(
-        "  goose schedule add --schedule-id daily-backup --cron \"@daily\" --recipe-source backup.yaml"
+        "  kory schedule add --schedule-id daily-backup --cron \"@daily\" --recipe-source backup.yaml"
     );
-    println!("  goose schedule add --schedule-id weekly-summary --cron \"0 9 * * 1\" --recipe-source summary.yaml");
+    println!("  kory schedule add --schedule-id weekly-summary --cron \"0 9 * * 1\" --recipe-source summary.yaml");
 
     Ok(())
 }

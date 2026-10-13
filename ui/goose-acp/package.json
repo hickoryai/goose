@@ -24,7 +24,7 @@
     }
   },
   "bin": {
-    "goose": "./bin/goose.mjs"
+    "kory": "./bin/kory.mjs"
   },
   "files": [
     "bin",

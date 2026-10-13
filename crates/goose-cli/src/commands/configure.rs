@@ -145,8 +145,8 @@ impl Drop for CursorRestoreGuard {
 pub async fn handle_configure() -> anyhow::Result<()> {
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
-            "goose configure requires an interactive terminal.\n\
-             If you installed via 'curl ... | bash', run 'goose configure' separately after installation."
+            "kory configure requires an interactive terminal.\n\
+             If you installed via 'curl ... | bash', run 'kory configure' separately after installation."
         );
     }
 
@@ -203,7 +203,7 @@ pub fn configure_telemetry_consent_dialog() -> anyhow::Result<bool> {
     );
     println!(
         "{}",
-        style("or any personal data. You can change this anytime with 'goose configure'.").dim()
+        style("or any personal data. You can change this anytime with 'kory configure'.").dim()
     );
     println!();
 
@@ -298,7 +298,7 @@ fn configure_first_time_goose_mode(
     cliclack::intro(style(" goose-mode ").on_cyan().black())?;
     let _ = cliclack::log::info(
         "goose mode controls whether goose uses tools freely or asks for your approval first.\n\
-         Auto is the default. You can change it later in 'goose configure' > goose settings.",
+         Auto is the default. You can change it later in 'kory configure' > goose settings.",
     );
     let mode = select()?;
     config.set_goose_mode(mode)?;
@@ -312,7 +312,7 @@ async fn handle_manual_provider_setup(config: &Config) {
             println!(
                 "\n  {}: Run '{}' again to adjust your config or add extensions",
                 style("Tip").green().italic(),
-                style("goose configure").cyan()
+                style("kory configure").cyan()
             );
             set_extension(ExtensionEntry {
                 enabled: true,
@@ -324,7 +324,7 @@ async fn handle_manual_provider_setup(config: &Config) {
             println!(
                 "\n  {}: We did not save your config, inspect your credentials\n   and run '{}' again to ensure goose can connect",
                 style("Warning").yellow().italic(),
-                style("goose configure").cyan()
+                style("kory configure").cyan()
             );
         }
         Err(e) => {
@@ -341,7 +341,7 @@ fn print_manual_config_error(e: &anyhow::Error) {
                 "\n  {} Required configuration key '{}' not found \n  Please provide this value and run '{}' again",
                 style("Error").red().italic(),
                 key,
-                style("goose configure").cyan()
+                style("kory configure").cyan()
             );
         }
         Some(ConfigError::KeyringError(msg)) => {
@@ -352,7 +352,7 @@ fn print_manual_config_error(e: &anyhow::Error) {
                 "\n  {} Invalid configuration value: {} \n  Please check your input and run '{}' again",
                 style("Error").red().italic(),
                 msg,
-                style("goose configure").cyan()
+                style("kory configure").cyan()
             );
         }
         Some(ConfigError::FileError(err)) => {
@@ -360,7 +360,7 @@ fn print_manual_config_error(e: &anyhow::Error) {
                 "\n  {} Failed to access config file: {} \n  Please check file permissions and run '{}' again",
                 style("Error").red().italic(),
                 err,
-                style("goose configure").cyan()
+                style("kory configure").cyan()
             );
         }
         Some(ConfigError::DirectoryError(msg)) => {
@@ -368,7 +368,7 @@ fn print_manual_config_error(e: &anyhow::Error) {
                 "\n  {} Failed to access config directory: {} \n  Please check directory permissions and run '{}' again",
                 style("Error").red().italic(),
                 msg,
-                style("goose configure").cyan()
+                style("kory configure").cyan()
             );
         }
         _ => {
@@ -376,7 +376,7 @@ fn print_manual_config_error(e: &anyhow::Error) {
                 "\n  {} {} \n  We did not save your config, inspect your credentials\n   and run '{}' again to ensure goose can connect",
                 style("Error").red().italic(),
                 e,
-                style("goose configure").cyan()
+                style("kory configure").cyan()
             );
         }
     }
@@ -388,7 +388,7 @@ fn print_keyring_error(msg: &str) {
         "\n  {} Failed to access secure storage (keyring): {} \n  Please check your system keychain and run '{}' again. \n  If your system is unable to use the keyring, please try setting secret key(s) via environment variables.",
         style("Error").red().italic(),
         msg,
-        style("goose configure").cyan()
+        style("kory configure").cyan()
     );
 }
 
@@ -398,7 +398,7 @@ fn print_keyring_error(msg: &str) {
         "\n  {} Failed to access Windows Credential Manager: {} \n  Please check Windows Credential Manager and run '{}' again. \n  If your system is unable to use the Credential Manager, please try setting secret key(s) via environment variables.",
         style("Error").red().italic(),
         msg,
-        style("goose configure").cyan()
+        style("kory configure").cyan()
     );
 }
 
@@ -408,7 +408,7 @@ fn print_keyring_error(msg: &str) {
         "\n  {} Failed to access secure storage: {} \n  Please check your system's secure storage and run '{}' again. \n  If your system is unable to use secure storage, please try setting secret key(s) via environment variables.",
         style("Error").red().italic(),
         msg,
-        style("goose configure").cyan()
+        style("kory configure").cyan()
     );
 }
 

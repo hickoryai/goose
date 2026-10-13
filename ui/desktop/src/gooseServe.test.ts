@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildLocalServeUrls, findGooseBinaryPath, startGooseServe } from './gooseServe';
 
-const binaryName = process.platform === 'win32' ? 'goose.exe' : 'goose';
+const binaryName = process.platform === 'win32' ? 'kory.exe' : 'kory';
 const tempDirs: string[] = [];
 const originalCwd = process.cwd();
 type ReadinessFetchInit = Parameters<typeof globalThis.fetch>[1];
@@ -133,7 +133,7 @@ describe('startGooseServe', () => {
   it.skipIf(process.platform === 'win32')('uses the injected readiness fetch', async () => {
     const tempDir = makeTempDir();
     const goosePath = makeExecutable(
-      path.join(tempDir, 'goose'),
+      path.join(tempDir, 'kory'),
       '#!/usr/bin/env sh\nwhile true; do sleep 1; done\n'
     );
     vi.stubEnv('GOOSE_BINARY', goosePath);
@@ -161,7 +161,7 @@ describe('startGooseServe', () => {
   it.skipIf(process.platform === 'win32')('captures the TLS fingerprint from stdout', async () => {
     const tempDir = makeTempDir();
     const goosePath = makeExecutable(
-      path.join(tempDir, 'goose'),
+      path.join(tempDir, 'kory'),
       [
         '#!/usr/bin/env sh',
         'printf "GOOSED_CERT_FINGERPRINT=AA:BB:CC\\n"',
@@ -206,7 +206,7 @@ describe('startGooseServe', () => {
     const tempDir = makeTempDir();
     const argsPath = path.join(tempDir, 'args.txt');
     const goosePath = makeExecutable(
-      path.join(tempDir, 'goose'),
+      path.join(tempDir, 'kory'),
       [
         '#!/usr/bin/env sh',
         'printf "%s\\n" "$@" > "$TEST_ARGS_PATH"',
@@ -253,7 +253,7 @@ describe('startGooseServe', () => {
   it.skipIf(process.platform === 'win32')('waits for TLS fingerprint after readiness succeeds', async () => {
     const tempDir = makeTempDir();
     const goosePath = makeExecutable(
-      path.join(tempDir, 'goose'),
+      path.join(tempDir, 'kory'),
       [
         '#!/usr/bin/env sh',
         'sleep 0.1',

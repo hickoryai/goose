@@ -38,8 +38,8 @@ function createLauncherHarness() {
   });
   mkdirSync(join(wrapperDir, "bin"));
   copyFileSync(
-    join(packageRoot, "bin", "goose.mjs"),
-    join(wrapperDir, "bin", "goose.mjs"),
+    join(packageRoot, "bin", "kory.mjs"),
+    join(wrapperDir, "bin", "kory.mjs"),
   );
 
   const platformKey = `${process.platform}-${process.arch}`;
@@ -48,7 +48,7 @@ function createLauncherHarness() {
 
   const platformPackageDir = join(scopeDir, packageName.slice("@aaif/".length));
   const platformBinDir = join(platformPackageDir, "bin");
-  const executableName = process.platform === "win32" ? "goose.exe" : "goose";
+  const executableName = process.platform === "win32" ? "kory.exe" : "kory";
   const executablePath = join(platformBinDir, executableName);
   mkdirSync(platformBinDir, { recursive: true });
   writeFileSync(
@@ -65,7 +65,7 @@ function createLauncherHarness() {
   }
   chmodSync(executablePath, 0o755);
 
-  return join(wrapperDir, "bin", "goose.mjs");
+  return join(wrapperDir, "bin", "kory.mjs");
 }
 
 function runLauncher(args, input) {

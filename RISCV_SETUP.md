@@ -249,10 +249,10 @@ Expected changes:
 ### 10. Build
 
 ```bash
-cargo build --release --target riscv64gc-unknown-linux-gnu -p goose-cli --bin goose
+cargo build --release --target riscv64gc-unknown-linux-gnu -p goose-cli --bin kory
 ```
 
-Output: `target/riscv64gc-unknown-linux-gnu/release/goose`
+Output: `target/riscv64gc-unknown-linux-gnu/release/kory`
 
 ## Complete Patch Script
 
@@ -276,10 +276,10 @@ For production PR, consider:
 
 ```bash
 # Check architecture
-file target/riscv64gc-unknown-linux-gnu/release/goose
+file target/riscv64gc-unknown-linux-gnu/release/kory
 # Output: ELF 64-bit LSB pie executable, UCB RISC-V
 
 # Test execution (on RISC-V hardware)
-./target/riscv64gc-unknown-linux-gnu/release/goose --version
-./target/riscv64gc-unknown-linux-gnu/release/goose doctor
+./target/riscv64gc-unknown-linux-gnu/release/kory --version
+./target/riscv64gc-unknown-linux-gnu/release/kory doctor
 ```

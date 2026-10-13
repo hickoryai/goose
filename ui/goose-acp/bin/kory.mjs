@@ -60,7 +60,7 @@ try {
 
 function reportError(error) {
   const message = error instanceof Error ? error.message : String(error);
-  console.error(`goose: ${message}`);
+  console.error(`kory: ${message}`);
 }
 
 function signalExitCode(signal) {

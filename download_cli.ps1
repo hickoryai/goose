@@ -8,7 +8,7 @@
 # Supported Architectures: x86_64
 #
 # Usage:
-#   Invoke-WebRequest -Uri "https://github.com/aaif-goose/goose/releases/download/stable/download_cli.ps1" -OutFile "download_cli.ps1"; .\download_cli.ps1
+#   Invoke-WebRequest -Uri "https://github.com/hickoryai/goose/releases/download/stable/download_cli.ps1" -OutFile "download_cli.ps1"; .\download_cli.ps1
 #   Or simply: .\download_cli.ps1
 #
 # Environment variables:
@@ -18,15 +18,15 @@
 #   $env:GOOSE_MODEL    - Optional: model for goose
 #   $env:GOOSE_WINDOWS_VARIANT - Optional: Windows package variant to install ("standard" or "cuda")
 #   $env:CANARY         - Optional: if set to "true", downloads from canary release instead of stable
-#   $env:CONFIGURE      - Optional: if set to "false", disables running goose configure interactively
+#   $env:CONFIGURE      - Optional: if set to "false", disables running kory configure interactively
 ##############################################################################
 
 # Set error action preference to stop on errors
 $ErrorActionPreference = "Stop"
 
 # --- 1) Variables ---
-$REPO = "aaif-goose/goose"
-$OUT_FILE = "goose.exe"
+$REPO = "hickoryai/goose"
+$OUT_FILE = "kory.exe"
 
 # Set default bin directory if not specified
 if (-not $env:GOOSE_BIN_DIR) {
@@ -70,7 +70,7 @@ if ($WINDOWS_VARIANT -ne "standard" -and $WINDOWS_VARIANT -ne "cuda") {
 }
 
 # --- 3) Build download URL ---
-$FILE = if ($WINDOWS_VARIANT -eq "cuda") { "goose-$ARCH-pc-windows-msvc-cuda.zip" } else { "goose-$ARCH-pc-windows-msvc.zip" }
+$FILE = if ($WINDOWS_VARIANT -eq "cuda") { "kory-$ARCH-pc-windows-msvc-cuda.zip" } else { "kory-$ARCH-pc-windows-msvc.zip" }
 $DOWNLOAD_URL = "https://github.com/$REPO/releases/download/$RELEASE_TAG/$FILE"
 
 Write-Host "Downloading $RELEASE_TAG release: $FILE..." -ForegroundColor Green
@@ -110,9 +110,9 @@ Remove-Item -Path $FILE -Force
 
 # --- 7) Determine extraction directory ---
 $EXTRACT_DIR = $TMP_DIR
-if (Test-Path (Join-Path $TMP_DIR "goose-package")) {
-    Write-Host "Found goose-package subdirectory, using that as extraction directory" -ForegroundColor Yellow
-    $EXTRACT_DIR = Join-Path $TMP_DIR "goose-package"
+if (Test-Path (Join-Path $TMP_DIR "kory-package")) {
+    Write-Host "Found kory-package subdirectory, using that as extraction directory" -ForegroundColor Yellow
+    $EXTRACT_DIR = Join-Path $TMP_DIR "kory-package"
 }
 
 # --- 8) Create bin directory if it doesn't exist ---
@@ -128,11 +128,11 @@ if (-not (Test-Path $env:GOOSE_BIN_DIR)) {
 }
 
 # --- 9) Install goose binary ---
-$SOURCE_GOOSE = Join-Path $EXTRACT_DIR "goose.exe"
+$SOURCE_GOOSE = Join-Path $EXTRACT_DIR "kory.exe"
 $DEST_GOOSE = Join-Path $env:GOOSE_BIN_DIR $OUT_FILE
 
 if (Test-Path $SOURCE_GOOSE) {
-    Write-Host "Moving goose to $DEST_GOOSE" -ForegroundColor Green
+    Write-Host "Moving kory to $DEST_GOOSE" -ForegroundColor Green
     try {
         # Remove existing file if it exists to avoid conflicts
         if (Test-Path $DEST_GOOSE) {
@@ -140,12 +140,12 @@ if (Test-Path $SOURCE_GOOSE) {
         }
         Move-Item -Path $SOURCE_GOOSE -Destination $DEST_GOOSE -Force
     } catch {
-        Write-Error "Failed to move goose.exe to $DEST_GOOSE. Error: $($_.Exception.Message)"
+        Write-Error "Failed to move kory.exe to $DEST_GOOSE. Error: $($_.Exception.Message)"
         Remove-Item -Path $TMP_DIR -Recurse -Force -ErrorAction SilentlyContinue
         exit 1
     }
 } else {
-    Write-Error "goose.exe not found in extracted files"
+    Write-Error "kory.exe not found in extracted files"
     Remove-Item -Path $TMP_DIR -Recurse -Force -ErrorAction SilentlyContinue
     exit 1
 }
@@ -182,10 +182,10 @@ if ($CONFIGURE -eq "true") {
     try {
         & $DEST_GOOSE configure
     } catch {
-        Write-Warning "Failed to run goose configure. You may need to run it manually later."
+        Write-Warning "Failed to run kory configure. You may need to run it manually later."
     }
 } else {
-    Write-Host "Skipping 'goose configure', you may need to run this manually later" -ForegroundColor Yellow
+    Write-Host "Skipping 'kory configure', you may need to run this manually later" -ForegroundColor Yellow
 }
 
 # --- 13) Check PATH and give instructions if needed ---
@@ -205,4 +205,4 @@ if ($CURRENT_PATH -notlike "*$env:GOOSE_BIN_DIR*") {
 }
 
 Write-Host "goose CLI installation completed successfully!" -ForegroundColor Green
-Write-Host "goose is installed at: $DEST_GOOSE" -ForegroundColor Green
+Write-Host "kory is installed at: $DEST_GOOSE" -ForegroundColor Green

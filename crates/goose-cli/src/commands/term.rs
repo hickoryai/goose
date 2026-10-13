@@ -93,7 +93,7 @@ function @goose; {goose_bin} term run $argv; end
 function @g; {goose_bin} term run $argv; end
 
 function goose_preexec --on-event fish_preexec
-    string match -q -r '^goose term' -- $argv[1]; and return
+    string match -q -r '^kory term' -- $argv[1]; and return
     string match -q -r '^(@goose|@g)($|\s)' -- $argv[1]; and return
     {goose_bin} term log "$argv[1]" 2>/dev/null &
 end"#,
@@ -114,7 +114,7 @@ if (($env | get -o GOOSE_NU_PREEXEC_INSTALLED | default false) != true) {
             if ($line | is-empty) {
                 return
             }
-            if ($line =~ '^goose term(\s|$)') {
+            if ($line =~ '^kory term(\s|$)') {
                 return
             }
             if ($line =~ '^(@goose|@g)(\s|$)') {
@@ -144,7 +144,7 @@ function @g {{ & '{goose_bin}' term run @args }}
 Set-PSReadLineKeyHandler -Chord Enter -ScriptBlock {{
     $line = $null
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$null)
-    if ($line -notmatch '^goose term' -and $line -notmatch '^(@goose|@g)($|\s)') {{
+    if ($line -notmatch '^kory term' -and $line -notmatch '^(@goose|@g)($|\s)') {{
         Start-Job -ScriptBlock {{ & '{goose_bin}' term log $using:line }} | Out-Null
     }}
     [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
@@ -218,7 +218,7 @@ pub async fn handle_term_init(
 
     let goose_bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "goose".to_string());
+        .unwrap_or_else(|_| "kory".to_string());
 
     println!(
         "{}",
@@ -230,7 +230,7 @@ pub async fn handle_term_init(
 pub async fn handle_term_log(command: String) -> Result<()> {
     let session_id = std::env::var("AGENT_SESSION_ID").map_err(|_| {
         anyhow!(
-            "AGENT_SESSION_ID not set. Initialize terminal integration with `goose term init <shell>` and reload your shell first."
+            "AGENT_SESSION_ID not set. Initialize terminal integration with `kory term init <shell>` and reload your shell first."
         )
     })?;
 
@@ -267,7 +267,7 @@ pub async fn handle_term_run(prompt: Vec<String>) -> Result<()> {
     let session_id = std::env::var("AGENT_SESSION_ID").map_err(|_| {
         anyhow!(
             "AGENT_SESSION_ID not set.\n\n\
-             Initialize terminal integration with `goose term init <shell>` in your shell profile, \
+             Initialize terminal integration with `kory term init <shell>` in your shell profile, \
              then restart or reload that shell."
         )
     })?;
@@ -327,7 +327,7 @@ pub async fn handle_term_run(prompt: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// Handle `goose term info` - print compact session info for prompt integration
+/// Handle `kory term info` - print compact session info for prompt integration
 pub async fn handle_term_info() -> Result<()> {
     let session_id = match std::env::var("AGENT_SESSION_ID") {
         Ok(id) => id,

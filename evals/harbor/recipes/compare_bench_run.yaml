@@ -81,7 +81,7 @@ prompt: |
   tell application "iTerm"
       tell current window
           create tab with default profile
-          tell current session to write text "cd $REPO && goose run --recipe evals/harbor/recipes/analyze_bench_failure.yaml --interactive --params=target={{ target }} --params=reference={{ reference }} --params=task=<TASK>"
+          tell current session to write text "cd $REPO && kory run --recipe evals/harbor/recipes/analyze_bench_failure.yaml --interactive --params=target={{ target }} --params=reference={{ reference }} --params=task=<TASK>"
       end tell
   end tell
   APPLESCRIPT

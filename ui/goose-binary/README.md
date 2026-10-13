@@ -1,7 +1,7 @@
 # Native Binary Packages for goose
 
 This directory contains the npm package scaffolding for distributing the
-`goose` Rust binary as platform-specific npm packages.
+`kory` Rust binary as platform-specific npm packages.
 
 ## Packages
 
@@ -17,10 +17,10 @@ This directory contains the npm package scaffolding for distributing the
 
 These are platform-specific implementation dependencies and are not intended
 to be installed directly. Install `@aaif/goose-acp` instead. It installs the
-appropriate package automatically and provides the `goose` command. Each
+appropriate package automatically and provides the `kory` command. Each
 binary package contains its native executable. Its platform-specific internal
 command preserves executable permissions during npm packing;
-`@aaif/goose-acp` remains the sole owner of the supported `goose` command.
+`@aaif/goose-acp` remains the sole owner of the supported `kory` command.
 
 ## Release preparation
 

@@ -20,9 +20,9 @@
     "x64"
   ],
   "bin": {
-    "goose-binary-win32-x64": "./bin/goose.exe"
+    "goose-binary-win32-x64": "./bin/kory.exe"
   },
   "files": [
-    "bin/goose.exe"
+    "bin/kory.exe"
   ]
 }

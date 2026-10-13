@@ -200,7 +200,7 @@ jobs:
 
           echo "$GOOSE_RECIPE" | envsubst '$ISSUE_NUMBER $ISSUE_TITLE $TRIGGER_COMMENT' > /tmp/recipe.yaml
 
-          goose run --recipe /tmp/recipe.yaml
+          kory run --recipe /tmp/recipe.yaml
 
           if [ -n "$(git status --porcelain)" ] && [ -f /tmp/issue_summary.txt ]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT

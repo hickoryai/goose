@@ -71,7 +71,7 @@ export function resolveGooseBinaryForRuntime(
     );
   }
 
-  const executableName = platform === "win32" ? "goose.exe" : "goose";
+  const executableName = platform === "win32" ? "kory.exe" : "kory";
   const binaryPath = resolve(dirname(packageJsonPath), "bin", executableName);
 
   if (!dependencies.isFile(binaryPath)) {

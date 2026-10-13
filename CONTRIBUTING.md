@@ -136,19 +136,19 @@ cargo build
 When that completes, debug builds of the binaries are available, including the goose CLI:
 
 ```
-./target/debug/goose --help
+./target/debug/kory --help
 ```
 
 For first-time setup, run the configure command:
 
 ```
-./target/debug/goose configure
+./target/debug/kory configure
 ```
 
 Once a connection to an LLM provider is working, start a session:
 
 ```
-./target/debug/goose session
+./target/debug/kory session
 ```
 
 These same commands can be recompiled and immediately run using `cargo run -p goose-cli` for iteration.
@@ -191,7 +191,7 @@ To debug the external ACP backend, run it from an IDE. The configuration will de
 
 ```
 export GOOSE_SERVER__SECRET_KEY=test
-cargo run --package goose-cli --bin goose -- serve --platform desktop --enable-scheduler --host 127.0.0.1 --port 3000
+cargo run --package goose-cli --bin kory -- serve --platform desktop --enable-scheduler --host 127.0.0.1 --port 3000
 ```
 
 The `debug-ui` recipe connects to `http://127.0.0.1:3000` by default. If the
@@ -320,7 +320,7 @@ When testing changes or running multiple goose configurations, use `GOOSE_PATH_R
 ```bash
 # Test with a clean environment
 export GOOSE_PATH_ROOT="/tmp/goose-test"
-./target/debug/goose session
+./target/debug/kory session
 
 # Or for a single command
 GOOSE_PATH_ROOT="/tmp/goose-dev" cargo run -p goose-cli -- session

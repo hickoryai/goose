@@ -32,7 +32,7 @@ Display the help menu.
 
 **Usage:**
 ```bash
-goose --help
+kory --help
 ```
 
 ---
@@ -42,11 +42,11 @@ Configure goose settings - providers, extensions, etc.
 
 **Usage:**
 ```bash
-goose configure
+kory configure
 ```
 
 :::tip Type to Filter
-When selecting from menus in `goose configure`, start typing to filter options in real-time. This works for lists of providers, extensions, and tools.
+When selecting from menus in `kory configure`, start typing to filter options in real-time. This works for lists of providers, extensions, and tools.
 :::
 
 ---
@@ -59,7 +59,7 @@ Shows goose information, including the version, configuration file location, ses
 
 **Usage:**
 ```bash
-goose info
+kory info
 ```
 
 ---
@@ -69,7 +69,7 @@ Check the current goose version you have installed.
 
 **Usage:**
 ```bash
-goose --version
+kory --version
 ```
 
 ---
@@ -84,13 +84,13 @@ Update the goose CLI to a newer version.
 **Usage:**
 ```bash
 # Update to latest stable version
-goose update
+kory update
 
 # Update to latest canary version
-goose update --canary
+kory update --canary
 
 # Update and reconfigure settings
-goose update --reconfigure
+kory update --reconfigure
 ```
 
 ---
@@ -109,10 +109,10 @@ Once installed, you can:
 **Usage:**
 ```bash
 # Generate completion script for your shell (outputs to stdout)
-goose completion bash
-goose completion zsh
-goose completion fish
-goose completion nu
+kory completion bash
+kory completion zsh
+kory completion fish
+kory completion nu
 ```
 
 **Installation by Shell:**
@@ -123,7 +123,7 @@ goose completion nu
 Add this line to your `~/.zshrc`:
 
 ```bash
-eval "$(goose completion zsh)"
+eval "$(kory completion zsh)"
 ```
 
 Then reload your shell:
@@ -137,7 +137,7 @@ source ~/.zshrc
 Add this line to your `~/.bashrc` or `~/.bash_profile`:
 
 ```bash
-eval "$(goose completion bash)"
+eval "$(kory completion bash)"
 ```
 
 Then reload your shell:
@@ -149,7 +149,7 @@ source ~/.bashrc
 <TabItem value="fish" label="Fish">
 
 ```bash
-goose completion fish > ~/.config/fish/completions/goose.fish
+kory completion fish > ~/.config/fish/completions/kory.fish
 ```
 
 Then restart your terminal or run `exec fish`.
@@ -160,12 +160,12 @@ Then restart your terminal or run `exec fish`.
 ```nu
 let autoload_dir = ($nu.user-autoload-dirs | first)
 mkdir $autoload_dir
-goose completion nu | save --force ($autoload_dir | path join "goose.nu")
+kory completion nu | save --force ($autoload_dir | path join "kory.nu")
 ```
 
 Then restart Nushell or run:
 ```nu
-source (($nu.user-autoload-dirs | first) | path join "goose.nu")
+source (($nu.user-autoload-dirs | first) | path join "kory.nu")
 ```
 
 </TabItem>
@@ -174,7 +174,7 @@ source (($nu.user-autoload-dirs | first) | path join "goose.nu")
 Add this line to your PowerShell profile:
 
 ```powershell
-goose completion powershell | Out-String | Invoke-Expression
+kory completion powershell | Out-String | Invoke-Expression
 ```
 
 Then reload your profile:
@@ -186,7 +186,7 @@ Then reload your profile:
 </Tabs>
 
 :::tip Testing
-After installing and reloading your shell, test completion by typing `goose ` and pressing Tab to see available commands, or `goose session --` and Tab to see available options.
+After installing and reloading your shell, test completion by typing `kory ` and pressing Tab to see available commands, or `kory session --` and Tab to see available options.
 :::
 
 ---
@@ -222,42 +222,42 @@ Start or resume interactive chat sessions.
 **Usage:**
 ```bash
 # Start a basic session
-goose session -n my-project
+kory session -n my-project
 
 # Resume a previous session
-goose session --resume -n my-project
-goose session --resume --session-id 20251108_2
-goose session --resume --path ./session.json    # exported session
-goose session --resume --path ./session.jsonl   # legacy session storage
+kory session --resume -n my-project
+kory session --resume --session-id 20251108_2
+kory session --resume --path ./session.json    # exported session
+kory session --resume --path ./session.jsonl   # legacy session storage
 
 # Fork a specific session by name
-goose session --resume --fork --name my-project
+kory session --resume --fork --name my-project
 
 # Fork the most recent session and show message history
-goose session --resume --fork --history
+kory session --resume --fork --history
 
 # Edit a session's conversation in your editor
-goose session --resume --session-id 20251108_2 --edit
+kory session --resume --session-id 20251108_2 --edit
 
 # Edit and fork — create a new session from the edited conversation
-goose session --resume --session-id 20251108_2 --fork --edit --history
+kory session --resume --session-id 20251108_2 --fork --edit --history
 
 # Start with extensions
-goose session --with-extension "npx -y @modelcontextprotocol/server-memory"
+kory session --with-extension "npx -y @modelcontextprotocol/server-memory"
 
 # Name an extension explicitly (tools become memory__*, not npx__*)
-goose session --with-extension "memory:npx -y @modelcontextprotocol/server-memory"
-goose session --with-builtin developer
-goose session --with-streamable-http-extension "http://localhost:8080/mcp"
+kory session --with-extension "memory:npx -y @modelcontextprotocol/server-memory"
+kory session --with-builtin developer
+kory session --with-streamable-http-extension "http://localhost:8080/mcp"
 
 # Advanced: Mix multiple extension types
-goose session \
+kory session \
   --with-extension "echo hello" \
   --with-streamable-http-extension "http://localhost:8080/mcp" \
   --with-builtin "developer"
 
 # Control session behavior
-goose session -n my-session --debug --max-turns 25
+kory session -n my-session --debug --max-turns 25
 ```
 
 ---
@@ -274,19 +274,19 @@ List all saved sessions.
 **Usage:**
 ```bash
 # List all sessions in text format (default)
-goose session list
+kory session list
 
 # List sessions in JSON format
-goose session list --format json
+kory session list --format json
 
 # Sort sessions by date in ascending order
-goose session list --ascending
+kory session list --ascending
 
 # Filter sessions by working directory
-goose session list -w ~/projects/myapp
+kory session list -w ~/projects/myapp
 
 # List only the 10 most recent sessions
-goose session list --limit 10
+kory session list --limit 10
 ```
 
 ---
@@ -303,19 +303,19 @@ Remove one or more saved sessions.
 **Usage:**
 ```bash
 # Interactive removal (prompts you to choose sessions)
-goose session remove
+kory session remove
 
 # Remove a specific session by ID
-goose session remove --session-id 20251108_3
+kory session remove --session-id 20251108_3
 
 # Remove a specific session by name
-goose session remove -n my-project
+kory session remove -n my-project
 
 # Remove all sessions starting with "project-"
-goose session remove -r "project-.*"
+kory session remove -r "project-.*"
 
 # Remove all sessions containing "migration"
-goose session remove -r ".*migration.*"
+kory session remove -r ".*migration.*"
 ```
 
 :::caution
@@ -334,10 +334,10 @@ Rename a saved session. If no session ID is provided, goose will prompt you to s
 **Usage:**
 ```bash
 # Rename a specific session by ID
-goose session rename --session-id 20251108_3 --new-name my-project
+kory session rename --session-id 20251108_3 --new-name my-project
 
 # Interactive selection (prompts you to choose a session)
-goose session rename --new-name my-project
+kory session rename --new-name my-project
 ```
 
 ---
@@ -360,20 +360,20 @@ Export sessions in different formats for backup, sharing, migration, or document
 **Usage:**
 ```bash
 # Interactive export
-goose session export
+kory session export
 
 # Export specific session as JSON for backup
-goose session export -n my-session --format json -o session-backup.json
+kory session export -n my-session --format json -o session-backup.json
 
 # Export specific session as readable markdown
-goose session export -n my-session -o session.md
+kory session export -n my-session -o session.md
 
 # Export to stdout in different formats
-goose session export --session-id 20251108_4 --format json
-goose session export -n my-session --format yaml
+kory session export --session-id 20251108_4 --format json
+kory session export -n my-session --format yaml
 
 # Export session by path (legacy)
-goose session export --path ./my-session.jsonl -o exported.md
+kory session export --path ./my-session.jsonl -o exported.md
 ```
 
 ---
@@ -396,16 +396,16 @@ Generate a comprehensive diagnostics JSON report for troubleshooting issues with
 **Usage:**
 ```bash
 # Generate diagnostics for a specific session by ID
-goose session diagnostics --session-id 20251108_5
+kory session diagnostics --session-id 20251108_5
 
 # Generate diagnostics for a session by name
-goose session diagnostics -n my-project-session
+kory session diagnostics -n my-project-session
 
 # Save diagnostics to a custom location
-goose session diagnostics --session-id 20251108_5 -o /path/to/my-diagnostics.json
+kory session diagnostics --session-id 20251108_5 -o /path/to/my-diagnostics.json
 
 # Interactive selection (prompts you to choose a session)
-goose session diagnostics
+kory session diagnostics
 ```
 
 :::warning Privacy Notice
@@ -458,39 +458,39 @@ Execute commands from an instruction file or stdin. Check out the [full guide](/
 **Usage:**
 ```bash
 # Run from instruction file
-goose run --instructions plan.md
+kory run --instructions plan.md
 
 # Load a recipe with a prompt that goose executes and then exits  
-goose run --recipe recipe.yaml
+kory run --recipe recipe.yaml
 
 # Load a recipe and stay in an interactive session
-goose run --recipe recipe.yaml --interactive
+kory run --recipe recipe.yaml --interactive
 
 # Load a recipe in debug mode
-goose run --recipe recipe.yaml --debug
+kory run --recipe recipe.yaml --debug
 
 # Show recipe details
-goose run --recipe recipe.yaml --explain
+kory run --recipe recipe.yaml --explain
 
 # Run a recipe with parameters
-goose run --recipe recipe.yaml --params environment=production --params region=us-west-2
+kory run --recipe recipe.yaml --params environment=production --params region=us-west-2
 
 # Run instructions from a file without session storage
-goose run --no-session -i instructions.txt
+kory run --no-session -i instructions.txt
 
 # Run with a specified provider and model
-goose run --provider anthropic --model claude-4-sonnet -t "initial prompt"
+kory run --provider anthropic --model claude-4-sonnet -t "initial prompt"
 
 # Run with limited turns before prompting user
-goose run --recipe recipe.yaml --max-turns 10
+kory run --recipe recipe.yaml --max-turns 10
 ```
 
 ---
 
 #### review [options] [range]
-Review the current git diff using goose. By default, `goose review` reviews the working tree against `HEAD`; pass a range such as `main...HEAD` to review a specific diff.
+Review the current git diff using goose. By default, `kory review` reviews the working tree against `HEAD`; pass a range such as `main...HEAD` to review a specific diff.
 
-`goose review` can discover review checks from `.agents/checks/*.md` and scoped review instructions from `.agents/REVIEW.md`.
+`kory review` can discover review checks from `.agents/checks/*.md` and scoped review instructions from `.agents/REVIEW.md`.
 
 **Options:**
 - **`--prompt <FILE>`**: Use a custom base review prompt
@@ -512,22 +512,22 @@ Review the current git diff using goose. By default, `goose review` reviews the 
 **Usage:**
 ```bash
 # Review the working tree against HEAD
-goose review
+kory review
 
 # Review a branch range
-goose review main...HEAD
+kory review main...HEAD
 
 # Add review intent
-goose review --instructions "This is a refactor; flag behavior changes"
+kory review --instructions "This is a refactor; flag behavior changes"
 
 # Review only selected files
-goose review --files crates/goose/src/agents/agent.rs documentation/docs/guides/goose-cli-commands.md
+kory review --files crates/goose/src/agents/agent.rs documentation/docs/guides/goose-cli-commands.md
 
 # Preview the assembled prompt and discovered checks
-goose review --dry-run
+kory review --dry-run
 
 # Run only named checks
-goose review --check-filter security performance --checks-only
+kory review --check-filter security performance --checks-only
 ```
 
 ---
@@ -591,13 +591,13 @@ Install and update git-backed plugins that provide skills or other Open Plugins 
 **Usage:**
 ```bash
 # Install a plugin from a git repository
-goose plugin install https://github.com/example/my-goose-plugin.git
+kory plugin install https://github.com/example/my-goose-plugin.git
 
 # Install a plugin and enable automatic update checks
-goose plugin install --auto-update https://github.com/example/my-goose-plugin.git
+kory plugin install --auto-update https://github.com/example/my-goose-plugin.git
 
 # Update an installed plugin manually
-goose plugin update my-plugin
+kory plugin update my-plugin
 ```
 
 Installed plugins are stored under `~/.agents/plugins/<plugin-name>/`. For more about plugin-provided skills, hooks, and update behavior, see the [Plugins guide](/docs/guides/context-engineering/plugins).
@@ -612,7 +612,7 @@ List skills available to the goose agent.
 
 **Usage:**
 ```bash
-goose skills list
+kory skills list
 ```
 
 ---
@@ -636,16 +636,16 @@ This command is available in goose builds that include local inference support.
 **Usage:**
 ```bash
 # Search for local models
-goose local-models search qwen --limit 5
+kory local-models search qwen --limit 5
 
 # Download a model from a search result
-goose local-models download 'user/repo:Q4_K_M'
+kory local-models download 'user/repo:Q4_K_M'
 
 # List downloaded models
-goose local-models list
+kory local-models list
 
 # Delete a downloaded model
-goose local-models delete user/repo:Q4_K_M
+kory local-models delete user/repo:Q4_K_M
 ```
 
 ---
@@ -669,22 +669,22 @@ Automate recipes by running them on a [schedule](/docs/guides/recipes/session-re
 
 **Usage:**
 ```bash
-goose schedule <COMMAND>
+kory schedule <COMMAND>
 
 # Add a new scheduled recipe which runs every day at 9 AM
-goose schedule add --schedule-id daily-report --cron "0 0 9 * * *" --recipe-source ./recipes/daily-report.yaml
+kory schedule add --schedule-id daily-report --cron "0 0 9 * * *" --recipe-source ./recipes/daily-report.yaml
 
 # List all scheduled jobs
-goose schedule list
+kory schedule list
 
 # List the 10 most recent goose sessions created by a scheduled job
-goose schedule sessions --schedule-id daily-report -l 10
+kory schedule sessions --schedule-id daily-report -l 10
 
 # Run a recipe immediately
-goose schedule run-now --schedule-id daily-report
+kory schedule run-now --schedule-id daily-report
 
 # Remove a scheduled job
-goose schedule remove --schedule-id daily-report
+kory schedule remove --schedule-id daily-report
 ```
 
 ---
@@ -709,11 +709,11 @@ ACP is an emerging protocol specification that standardizes communication betwee
 
 **Usage:**
 ```bash
-goose acp
+kory acp
 ```
 
 :::info
-This command is automatically invoked by ACP-compatible clients and is not typically run directly by users. The client manages the lifecycle of the `goose acp` process. See [Using goose in ACP Clients](/docs/gdk/acp) for details.
+This command is automatically invoked by ACP-compatible clients and is not typically run directly by users. The client manages the lifecycle of the `kory acp` process. See [Using goose in ACP Clients](/docs/gdk/acp) for details.
 :::
 
 :::warning Unattended environments
@@ -722,7 +722,7 @@ goose uses the system keyring by default. On macOS, reading a credential may dis
 Disable keyring access for that process and provide provider credentials through environment variables:
 
 ```bash
-GOOSE_DISABLE_KEYRING=1 OPENAI_API_KEY='...' goose acp
+GOOSE_DISABLE_KEYRING=1 OPENAI_API_KEY='...' kory acp
 ```
 :::
 
@@ -744,17 +744,17 @@ Start goose as an Agent Client Protocol (ACP) server over HTTP and WebSocket.
 export GOOSE_SERVER__SECRET_KEY=$(openssl rand -hex 32)
 
 # Start the ACP server on localhost:3284
-goose serve
+kory serve
 
 # Bind to a different host and port
-goose serve --host 0.0.0.0 --port 3284
+kory serve --host 0.0.0.0 --port 3284
 
 # Start with specific built-in extensions
-goose serve --with-builtin developer,memory
+kory serve --with-builtin developer,memory
 ```
 
 :::warning
-`goose serve` requires `GOOSE_SERVER__SECRET_KEY` unless you pass `--dangerously-unauthenticated`. Only use `--dangerously-unauthenticated` with local trusted clients.
+`kory serve` requires `GOOSE_SERVER__SECRET_KEY` unless you pass `--dangerously-unauthenticated`. Only use `--dangerously-unauthenticated` with local trusted clients.
 :::
 
 ---
@@ -776,27 +776,27 @@ Set up and use terminal-integrated sessions. Terminal integration gives each she
 **Usage:**
 ```bash
 # Set up zsh integration
-eval "$(goose term init zsh)"
+eval "$(kory term init zsh)"
 
 # Set up zsh integration and ask goose about unknown commands
-eval "$(goose term init zsh --default)"
+eval "$(kory term init zsh --default)"
 
 # Set up nushell integration
 let init = ($nu.cache-dir | path join "goose-term-init.nu")
-goose term init nu | save --force $init
+kory term init nu | save --force $init
 source $init
 
 # Send a prompt to the current terminal session
-goose term run why did the last command fail
+kory term run why did the last command fail
 
 # Print session info for prompt integration
-goose term info
+kory term info
 ```
 
 ---
 
 #### @goose / @g
-Ask goose questions directly from your shell prompt, with command history included in the context. These aliases are created by `goose term init` when you set up [terminal integration](/docs/guides/terminal-integration.md).
+Ask goose questions directly from your shell prompt, with command history included in the context. These aliases are created by `kory term init` when you set up [terminal integration](/docs/guides/terminal-integration.md).
 
 **Examples:**
 ```bash
@@ -812,7 +812,7 @@ Ask goose questions directly from your shell prompt, with command history includ
 
 ### Slash Commands
 
-Once you're in an interactive session (via `goose session` or `goose run --interactive`), you can use these slash commands. All commands support tab completion. Press `/ + <Tab>` to cycle through available commands.
+Once you're in an interactive session (via `kory session` or `kory run --interactive`), you can use these slash commands. All commands support tab completion. Press `/ + <Tab>` to cycle through available commands.
 
 **Available Commands:**
 - **`/?` or `/help`** - Display the help menu
@@ -882,7 +882,7 @@ The goose CLI theme is independent from the goose Desktop theme.
 ```bash
 # Set ANSI theme for the session via environment variable
 export GOOSE_CLI_THEME=ansi
-goose session --name use-custom-theme
+kory session --name use-custom-theme
 
 # Toggle theme during a session
 /t

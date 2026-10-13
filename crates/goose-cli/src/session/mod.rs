@@ -752,7 +752,7 @@ impl CliSession {
                     None => {
                         output::render_error(
                             "No editor found. Set one with:\n  \
-                                 goose configure set goose_prompt_editor \"vim\"\n  \
+                                 kory configure set goose_prompt_editor \"vim\"\n  \
                                  or set $VISUAL or $EDITOR in your shell.",
                         );
                     }
@@ -996,7 +996,7 @@ impl CliSession {
             Err(e) => {
                 output::render_error(&format!(
                     "Cannot switch to provider '{}': {}\n\
-                         Set credentials via `goose configure` or the appropriate environment variable.\n\
+                         Set credentials via `kory configure` or the appropriate environment variable.\n\
                          Session continues with current provider '{}'.",
                     target_provider_name, e, current_provider_name
                 ));

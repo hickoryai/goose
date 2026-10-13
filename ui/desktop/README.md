@@ -59,13 +59,13 @@ For Linux builds, first ensure you have the required system dependencies install
 1. Build the Rust binary:
 ```bash
 cd ../..  # Go to project root
-cargo build --release -p goose-cli --bin goose
+cargo build --release -p goose-cli --bin kory
 ```
 
 2. Copy the binary to the expected location:
 ```bash
 mkdir -p src/bin
-cp ../../target/release/goose src/bin/
+cp ../../target/release/kory src/bin/
 ```
 
 3. Build the application:
@@ -104,7 +104,7 @@ Use the existing Windows build process as documented.
 From the project root, start the ACP backend:
 
 ```bash
-GOOSE_SERVER__SECRET_KEY=test cargo run -p goose-cli --bin goose -- serve --platform desktop --enable-scheduler --host 127.0.0.1 --port 3000
+GOOSE_SERVER__SECRET_KEY=test cargo run -p goose-cli --bin kory -- serve --platform desktop --enable-scheduler --host 127.0.0.1 --port 3000
 ```
 
 Then start the desktop app from `ui/desktop`:

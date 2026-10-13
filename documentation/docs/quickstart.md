@@ -46,7 +46,7 @@ Let's begin 🚀
         Run the following command to install goose:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash
         ```
       </TabItem>
     </Tabs>
@@ -71,7 +71,7 @@ Let's begin 🚀
         Run the following command to install the goose CLI on Linux:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash
         ```   
       </TabItem>
     </Tabs>
@@ -93,13 +93,13 @@ Let's begin 🚀
         Run the following command in **Git Bash**, **MSYS2**, or **PowerShell** to install the goose CLI natively on Windows:
 
         ```bash
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash
         ```
         
         Learn about prerequisites in the [installation guide](/docs/getting-started/installation).
 
         :::info PATH Warning And Keyring
-        If you see a PATH warning after installation, you'll need to add goose to your PATH before running `goose configure`. See the [Windows CLI installation instructions](/docs/getting-started/installation) for detailed steps.
+        If you see a PATH warning after installation, you'll need to add goose to your PATH before running `kory configure`. See the [Windows CLI installation instructions](/docs/getting-started/installation) for detailed steps.
 
         If prompted during configuration, choose to not store to keyring. If you encounter keyring errors, see the [Windows setup instructions](/docs/getting-started/installation#set-llm-provider) for more information.
         :::
@@ -132,7 +132,7 @@ goose works with [supported LLM providers](/docs/getting-started/providers) that
   1. In your terminal, run the following command: 
 
     ```sh
-    goose configure
+    kory configure
     ```
 
   2. Select `Configure Providers` from the menu and press Enter.
@@ -227,7 +227,7 @@ Sessions are single, continuous conversations between you and goose. Let's start
         1. Make an empty directory (e.g. `goose-demo`) and navigate to that directory from the terminal.
         2. To start a new session, run:
         ```sh
-        goose session
+        kory session
         ```
 
     </TabItem>
@@ -263,7 +263,7 @@ While you're able to manually navigate to your working directory and open the HT
         1. End the current session by entering `Ctrl+C` so that you can return to the terminal's command prompt.
         2. Run the configuration command
         ```sh
-        goose configure
+        kory configure
         ```
         3. Choose `Add Extension` > `Built-in Extension` > `Computer Controller`, and set the timeout to 300s. This extension enables webscraping, file caching, and automations.
         ```
@@ -285,7 +285,7 @@ While you're able to manually navigate to your working directory and open the HT
         ```
         4. Now that goose has browser capabilities, let's resume your last session:
         ```sh
-         goose session -r
+         kory session -r
         ```
         5. Ask goose to launch your game in a browser:
     </TabItem>

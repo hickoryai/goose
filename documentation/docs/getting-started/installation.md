@@ -55,20 +55,20 @@ import { PanelLeft } from 'lucide-react';
         Run the following command to install the latest version of goose on macOS:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash
         ```
         This script will fetch the latest version of goose and set it up on your system.
 
         If you'd like to install without interactive configuration, disable `CONFIGURE`:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
         ```
 
         :::tip Updating goose
         It's best to keep goose updated. To update goose, run:
         ```sh
-        goose update
+        kory update
         ```
         :::
 
@@ -107,20 +107,20 @@ import { PanelLeft } from 'lucide-react';
         Run the following command to install the goose CLI on Linux:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash
         ```
         This script will fetch the latest version of goose and set it up on your system.
 
         If you'd like to install without interactive configuration, disable `CONFIGURE`:
 
         ```sh
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
         ```
 
         :::tip Updating goose
         It's best to keep goose updated. To update goose, run:
         ```sh
-        goose update
+        kory update
         ```
         :::
       </TabItem>
@@ -155,13 +155,13 @@ import { PanelLeft } from 'lucide-react';
         **Git Bash / MSYS2: Standard**
 
         ```bash
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+        curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash
         ```
 
         To install without interactive configuration, disable `CONFIGURE`:
 
         ```bash
-        curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+        curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
         ```
 
         **PowerShell Installation: Standard**
@@ -220,7 +220,7 @@ import { PanelLeft } from 'lucide-react';
 
           3. Run the goose installation script:
           ```bash
-          curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+          curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | bash
           ```
           :::tip
             If you encounter any issues on download, you might need to install `bzip2` to extract the downloaded file:
@@ -233,7 +233,7 @@ import { PanelLeft } from 'lucide-react';
           If you'd like to install without interactive configuration, disable `CONFIGURE`:
 
           ```sh
-          curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
+          curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash
           ```
 
           If needed, add goose to your path:
@@ -295,7 +295,7 @@ goose works with [supported LLM providers][providers] that give goose the AI int
   export OPENAI_API_KEY={your_api_key}
   ```
 
-  Then run `goose configure` again. goose will detect the environment variable and display:
+  Then run `kory configure` again. goose will detect the environment variable and display:
 
   ```
   ● OPENAI_API_KEY is set via environment variable
@@ -331,7 +331,7 @@ You can change your LLM provider and/or model or update your API key at any time
   <TabItem value="cli" label="goose CLI">
     1. Run the following command:
     ```sh
-    goose configure
+    kory configure
     ```
     2. Select `Configure Providers` from the menu.
     3. Follow the prompts to choose your LLM provider and enter or update your API key.
@@ -375,7 +375,7 @@ You can change your LLM provider and/or model or update your API key at any time
     <TabItem value="cli" label="goose CLI">
         From your terminal, navigate to the directory you'd like to start from and run:
         ```sh
-        goose session
+        kory session
         ```
     </TabItem>
 </Tabs>
@@ -397,7 +397,7 @@ While core configurations are shared between interfaces, extensions have flexibi
     <TabItem value="cli" label="goose CLI">
         Use the following command to manage shared configurations:
         ```sh
-        goose configure
+        kory configure
         ```
     </TabItem>
 </Tabs>

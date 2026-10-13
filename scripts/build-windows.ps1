@@ -42,7 +42,7 @@ Write-Host ""
 # Step 1: Clone or update repo
 Write-Host "[2/7] Building Rust backend (release)..." -ForegroundColor Yellow
 Write-Host "  This may take 5-15 minutes on first build..."
-cargo build --release -p goose-cli --bin goose
+cargo build --release -p goose-cli --bin kory
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Rust build failed!" -ForegroundColor Red
     exit 1
@@ -55,7 +55,7 @@ Write-Host "[3/7] Copying binaries to desktop app..." -ForegroundColor Yellow
 $binDir = "ui\desktop\src\bin"
 if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
 
-$gooseBinary = "target\release\goose.exe"
+$gooseBinary = "target\release\kory.exe"
 if (-not (Test-Path $gooseBinary)) {
     Write-Host "Backend binary not found: $gooseBinary" -ForegroundColor Red
     exit 1

@@ -1,4 +1,4 @@
-//! `goose roam` — peer-to-peer agent access over iroh.
+//! `kory roam` — peer-to-peer agent access over iroh.
 //!
 //! The model is deliberately infrastructural: roaming is just an authenticated
 //! p2p ACP transport. Each node has one identity and produces a **connection
@@ -217,7 +217,7 @@ pub enum RoamCommand {
     /// remote agent. Point Zed or any other ACP client at it
     /// and the remote agent behaves as if it were running locally.
     ///
-    /// Defaults to stdio (for a client that spawns `goose roam bridge ...` as a
+    /// Defaults to stdio (for a client that spawns `kory roam bridge ...` as a
     /// subprocess). Use `--listen` to accept a single TCP connection instead.
     Bridge {
         /// A saved peer nickname (see `roam peers`) or a `goose+roam://...` card.
@@ -347,8 +347,8 @@ async fn handle_id(qr: bool) -> Result<()> {
     eprintln!("  endpoint id : {}", card.endpoint_id);
     eprintln!("  fingerprint : {}", card.fingerprint());
     eprintln!();
-    eprintln!("the peer adds it with:  goose roam peers add '<card>' <name>");
-    eprintln!("and accepts you with:   goose roam peers accept <name>");
+    eprintln!("the peer adds it with:  kory roam peers add '<card>' <name>");
+    eprintln!("and accepts you with:   kory roam peers accept <name>");
     node.shutdown().await?;
     Ok(())
 }
@@ -445,7 +445,7 @@ async fn handle_peers(command: PeersCommand) -> Result<()> {
                 decoded.endpoint_id,
                 decoded.fingerprint()
             );
-            eprintln!("accept connections from it with: goose roam peers accept {name}");
+            eprintln!("accept connections from it with: kory roam peers accept {name}");
             Ok(())
         }
         PeersCommand::Accept { target, name } => {
@@ -465,7 +465,7 @@ async fn handle_peers(command: PeersCommand) -> Result<()> {
                     let rec = book.get(&target).ok_or_else(|| {
                         anyhow::anyhow!(
                             "no saved peer `{target}` and it is not a card; add it first with \
-                             `goose roam peers add`"
+                             `kory roam peers add`"
                         )
                     })?;
                     rec.card.clone()
@@ -482,7 +482,7 @@ async fn handle_peers(command: PeersCommand) -> Result<()> {
             )?;
             eprintln!("accepting connections from {}", card.endpoint_id);
             eprintln!("verify the fingerprint out of band: {}", card.fingerprint());
-            eprintln!("a running `goose roam share` picks this up on the next connection");
+            eprintln!("a running `kory roam share` picks this up on the next connection");
             Ok(())
         }
         PeersCommand::Revoke { target } => {
@@ -520,7 +520,7 @@ async fn handle_peers(command: PeersCommand) -> Result<()> {
                 trust.allowed_keys().into_iter().collect();
             let peers = book.list();
             if peers.is_empty() && accepted.is_empty() {
-                eprintln!("no saved peers; add one with `goose roam peers add '<card>' <name>`");
+                eprintln!("no saved peers; add one with `kory roam peers add '<card>' <name>`");
                 return Ok(());
             }
             println!("{:<16} {:<8} ENDPOINT ID", "NAME", "ACCEPT");
@@ -672,7 +672,7 @@ async fn handle_share(
     if accepted_count == 0 {
         eprintln!(
             "warning: no peers are accepted yet — no one can connect.\n\
-             Accept a peer's key first: goose roam peers accept <name|card>"
+             Accept a peer's key first: kory roam peers accept <name|card>"
         );
     }
 
@@ -745,7 +745,7 @@ fn resolve_card(target: &str) -> Result<ConnectionCard> {
     match book.get(target) {
         Some(rec) => Ok(rec.card.clone()),
         None => anyhow::bail!(
-            "no saved peer named `{target}` (and it is not a card); see `goose roam peers`"
+            "no saved peer named `{target}` (and it is not a card); see `kory roam peers`"
         ),
     }
 }

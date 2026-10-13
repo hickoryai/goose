@@ -80,10 +80,10 @@ jobs:
       - name: Install goose CLI
         run: |
           mkdir -p /home/runner/.local/bin
-          curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh \
+          curl -fsSL https://github.com/hickoryai/goose/releases/download/stable/download_cli.sh \
             | CONFIGURE=false GOOSE_BIN_DIR=/home/runner/.local/bin bash
           echo "/home/runner/.local/bin" >> $GITHUB_PATH
-          goose --version
+          kory --version
       
       - name: Configure goose for CI
         env:
@@ -187,7 +187,7 @@ jobs:
           ls -la
           echo ""
           echo "🤖 Applying changes to goose-cli-commands.md..."
-          goose run --recipe ../recipes/update-cli-commands.yaml
+          kory run --recipe ../recipes/update-cli-commands.yaml
       
       - name: Upload automation outputs
         if: always()

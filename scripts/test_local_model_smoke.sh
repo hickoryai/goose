@@ -8,11 +8,11 @@ show_usage() {
   echo "  -n, --top-n NUM          Number of recommended models to test (default: 3)"
   echo "  -m, --models MODELS      Comma-separated download ids. Skips search."
   echo "  -o, --output-dir DIR     Directory for logs (default: ./local-model-smoke-results)"
-  echo "      --ram-gb NUM         Override RAM passed to goose lm search"
+  echo "      --ram-gb NUM         Override RAM passed to kory lm search"
   echo "      --instruction TEXT   Prompt to send to each model"
-  echo "      --repo-prefix TEXT   Forwarded to goose lm search"
-  echo "      --repo-suffix TEXT   Forwarded to goose lm search"
-  echo "      --quant TEXT         Forwarded to goose lm search"
+  echo "      --repo-prefix TEXT   Forwarded to kory lm search"
+  echo "      --repo-suffix TEXT   Forwarded to kory lm search"
+  echo "      --quant TEXT         Forwarded to kory lm search"
   echo "      --download-retries N Retry model downloads after HF rate limits (default: 3)"
   echo "      --retry-delay SEC    Initial retry delay for HF rate limits (default: 60)"
   echo "      --run-timeout SEC    Kill a model run after this many seconds (default: 600, 0 disables)"
@@ -128,11 +128,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ -z "${SKIP_BUILD:-}" && -z "${GOOSE_BIN:-}" ]]; then
   echo "Building goose..."
-  (cd "$REPO_ROOT" && cargo build -p goose-cli --features local-inference --bin goose)
+  (cd "$REPO_ROOT" && cargo build -p goose-cli --features local-inference --bin kory)
   echo ""
 fi
 
-GOOSE_BIN="${GOOSE_BIN:-$REPO_ROOT/target/debug/goose}"
+GOOSE_BIN="${GOOSE_BIN:-$REPO_ROOT/target/debug/kory}"
 if [[ ! -x "$GOOSE_BIN" ]]; then
   echo "Error: goose binary not found or not executable: $GOOSE_BIN"
   exit 1

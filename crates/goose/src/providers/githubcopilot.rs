@@ -623,7 +623,7 @@ impl goose_providers::base::ProviderDescriptor for GithubCopilotProvider {
         ProviderMetadata::new(
             GITHUB_COPILOT_PROVIDER_NAME,
             "GitHub Copilot",
-            "GitHub Copilot. Run `goose configure` and select copilot to set up.",
+            "GitHub Copilot. Run `kory configure` and select copilot to set up.",
             GITHUB_COPILOT_DEFAULT_MODEL,
             GITHUB_COPILOT_KNOWN_MODELS.to_vec(),
             GITHUB_COPILOT_DOC_URL,

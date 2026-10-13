@@ -50,7 +50,7 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/goose /usr/local/bin/goose
+COPY --from=builder /build/target/release/kory /usr/local/bin/kory
 
 # Create non-root user
 RUN useradd -m -u 1000 -s /bin/bash goose && \
@@ -66,7 +66,7 @@ USER goose
 WORKDIR /home/goose
 
 # Default to goose CLI
-ENTRYPOINT ["/usr/local/bin/goose"]
+ENTRYPOINT ["/usr/local/bin/kory"]
 CMD ["--help"]
 
 # Labels for metadata

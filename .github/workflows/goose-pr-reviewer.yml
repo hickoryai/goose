@@ -280,7 +280,7 @@ jobs:
           echo "$INSTRUCTIONS" >> $GITHUB_OUTPUT
           echo "$DELIMITER" >> $GITHUB_OUTPUT
 
-      - name: Run goose review
+      - name: Run kory review
         id: goose
         env:
           PR_NUMBER: ${{ github.event.issue.number }}
@@ -300,7 +300,7 @@ jobs:
 
           echo "$GOOSE_RECIPE" | envsubst '$PR_NUMBER $PR_TITLE $PR_BODY $REVIEW_INSTRUCTIONS' > /tmp/recipe.yaml
 
-          goose run --recipe /tmp/recipe.yaml
+          kory run --recipe /tmp/recipe.yaml
 
           if [ -f /tmp/pr_review.md ]; then
             echo "has_review=true" >> $GITHUB_OUTPUT

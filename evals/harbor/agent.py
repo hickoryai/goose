@@ -64,7 +64,7 @@ class GooseBinaryAgent(Goose):
         return "goose-binary"
 
     def get_version_command(self) -> str | None:
-        return "/installed-agent/goose --version"
+        return "/installed-agent/kory --version"
 
     def _run_env(self) -> dict[str, str]:
         if not self.model_name or "/" not in self.model_name:
@@ -154,8 +154,8 @@ class GooseBinaryAgent(Goose):
         if not self.goose_binary.is_file():
             raise FileNotFoundError(f"Goose binary does not exist: {self.goose_binary}")
 
-        await environment.upload_file(self.goose_binary, "/installed-agent/goose")
-        await self.exec_as_root(environment, command="chmod 755 /installed-agent/goose")
+        await environment.upload_file(self.goose_binary, "/installed-agent/kory")
+        await self.exec_as_root(environment, command="chmod 755 /installed-agent/kory")
         if self.install_goose_runtime_deps:
             await self._install_goose_runtime_deps(environment)
         await self._ensure_ca_bundle(environment)
@@ -174,8 +174,8 @@ class GooseBinaryAgent(Goose):
             environment,
             command=(
                 "mkdir -p ~/.local/bin && "
-                "ln -sf /installed-agent/goose ~/.local/bin/goose && "
-                "~/.local/bin/goose --version"
+                "ln -sf /installed-agent/kory ~/.local/bin/kory && "
+                "~/.local/bin/kory --version"
             ),
             env={
                 "GOOSE_DISABLE_KEYRING": "true",
@@ -225,7 +225,7 @@ class GooseBinaryAgent(Goose):
             environment,
             command=(
                 'export PATH="$HOME/.local/bin:$PATH" && '
-                f"goose run --recipe {shlex.quote(CONTAINER_RECIPE_PATH)} "
+                f"kory run --recipe {shlex.quote(CONTAINER_RECIPE_PATH)} "
                 "--output-format stream-json "
                 + ((cli_flags + " ") if cli_flags else "")
                 + "2>&1 | stdbuf -oL tee /logs/agent/goose.txt"

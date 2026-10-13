@@ -1841,7 +1841,7 @@ impl GooseAcpAgent {
             .agent_capabilities(capabilities)
             .auth_methods(vec![AuthMethod::Agent(
                 AuthMethodAgent::new("goose-provider", "Configure Provider")
-                    .description("Run `goose configure` to set up your AI provider and API key"),
+                    .description("Run `kory configure` to set up your AI provider and API key"),
             )]))
     }
 

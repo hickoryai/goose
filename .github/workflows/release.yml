@@ -143,9 +143,11 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-path: |
-            goose-*.tar.bz2
-            goose-*.tar.gz
-            goose-*.zip
+            kory-*.tar.bz2
+            kory-*.tar.gz
+            kory-*.zip
+            goose-source-*.tar.gz
+            goose-source-*.zip
             Goose*.zip
             *.deb
             *.rpm
@@ -159,9 +161,11 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: |
-            goose-*.tar.bz2
-            goose-*.tar.gz
-            goose-*.zip
+            kory-*.tar.bz2
+            kory-*.tar.gz
+            kory-*.zip
+            goose-source-*.tar.gz
+            goose-source-*.zip
             Goose*.zip
             *.deb
             *.rpm
@@ -180,9 +184,11 @@ jobs:
           name: Stable
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: |
-            goose-*.tar.bz2
-            goose-*.tar.gz
-            goose-*.zip
+            kory-*.tar.bz2
+            kory-*.tar.gz
+            kory-*.zip
+            goose-source-*.tar.gz
+            goose-source-*.zip
             Goose*.zip
             *.deb
             *.rpm

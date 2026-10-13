@@ -160,7 +160,7 @@ docker run --rm \
   -u root \
   --entrypoint bash \
   goose:local \
-  -c "apt-get update && apt-get install -y vim && goose --version"
+  -c "apt-get update && apt-get install -y vim && kory --version"
 
 # Or create a custom Dockerfile
 FROM ghcr.io/aaif-goose/goose:latest
@@ -190,7 +190,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run goose analysis
         run: |
-          goose run -t "Review this codebase for security issues"
+          kory run -t "Review this codebase for security issues"
 ```
 
 ### GitLab CI
@@ -202,7 +202,7 @@ analyze:
     GOOSE_PROVIDER: openai
     GOOSE_MODEL: gpt-4o
   script:
-    - goose run -t "Generate documentation for this project"
+    - kory run -t "Generate documentation for this project"
 ```
 
 ## Image Details
@@ -212,7 +212,7 @@ analyze:
 - **Base image**: Debian Bookworm Slim (minimal runtime dependencies)
 - **Final size**: ~340MB
 - **Optimizations**: Link-Time Optimization (LTO), binary stripping, size optimization
-- **Binary included**: `/usr/local/bin/goose` (32MB)
+- **Binary included**: `/usr/local/bin/kory` (32MB)
 
 ### Security
 

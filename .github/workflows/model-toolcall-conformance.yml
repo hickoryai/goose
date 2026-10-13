@@ -47,7 +47,7 @@ jobs:
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
 
       - name: Build Binary
-        run: cargo build --bin goose
+        run: cargo build --bin kory
 
       - name: Run OpenRouter Tool Call Sweep
         env:
@@ -55,7 +55,7 @@ jobs:
           HOME: /tmp/goose-home
           GOOSE_DISABLE_KEYRING: 1
           SKIP_BUILD: 1
-          GOOSE_BIN: ${{ github.workspace }}/target/debug/goose
+          GOOSE_BIN: ${{ github.workspace }}/target/debug/kory
         run: |
           mkdir -p /tmp/goose-home
           if [ -n "${{ inputs.models }}" ]; then

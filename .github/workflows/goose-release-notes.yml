@@ -139,7 +139,7 @@ jobs:
           # Create recipe from env var with variable substitution
           echo "$GOOSE_RECIPE" | envsubst '$RELEASE_TAG' > /tmp/recipe.yaml
 
-          goose run --recipe /tmp/recipe.yaml
+          kory run --recipe /tmp/recipe.yaml
 
       - name: Read release notes
         id: read-notes
