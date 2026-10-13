@@ -204,6 +204,7 @@ impl GooseAcpAgent {
                     working_dir: cwd,
                     keyword: keyword.as_deref(),
                     only_sessions_with_messages: true,
+                    ..Default::default()
                 },
                 cursor: cursor.as_ref(),
                 page_size: SESSION_LIST_PAGE_SIZE,

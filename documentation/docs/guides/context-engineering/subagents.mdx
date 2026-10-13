@@ -64,6 +64,16 @@ When goose delegates work to a subagent, you can see the subagent's tool calls i
     - The subagent identifier (e.g., `subagent:16`)
     - The tool name (e.g., `text_editor`)
     - The extension providing the tool (e.g., `developer`)
+
+    To look inside a subagent while it runs, press `Tab` once goose prints `Press Tab to inspect child sessions.` A read-only navigator opens over the session and lists each child session with its state (`running`, `done`, `failed`, `cancelled`, or `stopped`) and latest activity. The parent session keeps running while the navigator is open, and its output appears when you close it.
+
+    - **`↑`/`↓`** or **`j`/`k`** - Select a child session
+    - **`Enter`** or **`→`** - Open the selected child's transcript and its own child sessions
+    - **`PgUp`/`PgDn`** or the mouse wheel - Scroll the transcript (it follows new output until you scroll up)
+    - **`Esc`**, **`←`**, or **`Backspace`** - Go back one level
+    - **`Tab`** or **`q`** - Close the navigator
+
+    You can also click a row to open it in terminals that support mouse reporting. Between turns, run `/children` to browse completed, failed, or stopped child sessions. The navigator is only available in an interactive terminal and is never shown with `--output-format json` or `stream-json`, in headless runs, or when output is redirected.
   </TabItem>
 </Tabs>
 

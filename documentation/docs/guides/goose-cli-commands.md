@@ -817,6 +817,7 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 **Available Commands:**
 - **`/?` or `/help`** - Display the help menu
 - **`/builtin <names>`** - Add builtin extensions by name (comma-separated)
+- **`/children`** - Browse this session's [subagent](/docs/guides/context-engineering/subagents#monitoring-subagent-activity) sessions in a read-only navigator
 - **`/clear`** - Clear the current chat history
 - **`/exit` or `/quit`** - Exit the session
 - **`/extension <command>`** - Add a stdio extension (format: ENV1=val1 command args...)
@@ -904,6 +905,7 @@ goose session --name use-custom-theme
 **Navigation:**
 - **`Cmd+Up/Down arrows`** - Navigate through command history
 - **`Ctrl+R`** - Interactive command history search (reverse search). [More info](#command-history-search).
+- **`Tab`** (while subagents run) - Open the read-only [child session navigator](/docs/guides/context-engineering/subagents#monitoring-subagent-activity)
 
 ---
 

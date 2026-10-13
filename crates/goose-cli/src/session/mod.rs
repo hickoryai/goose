@@ -1,4 +1,5 @@
 mod builder;
+mod child_sessions;
 mod completion;
 pub mod editor;
 mod elicitation;
@@ -727,6 +728,16 @@ impl CliSession {
                 history.save(editor);
                 self.handle_compact().await?;
             }
+            InputResult::Children => {
+                history.save(editor);
+                child_sessions::ChildSessionNavigator::new(
+                    self.agent.config.session_manager.clone(),
+                    self.session_id.clone(),
+                    true,
+                )
+                .browse()
+                .await;
+            }
             InputResult::Edit(prefill) => {
                 history.save(editor);
                 match crate::session::editor::resolve_editor_command() {
@@ -1339,15 +1350,43 @@ impl CliSession {
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
         let mut stream_error = None;
+        let mut children = child_sessions::ChildSessionNavigator::new(
+            self.agent.config.session_manager.clone(),
+            self.session_id.clone(),
+            interactive && !is_json_mode && !is_stream_json_mode,
+        );
+        let mut deferred_messages: Vec<Message> = Vec::new();
+        let mut refresh_children = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
 
         use futures::StreamExt;
         loop {
             tokio::select! {
+                key = children.next_key() => {
+                    let was_open = children.is_open();
+                    if !was_open {
+                        output::hide_thinking();
+                        let _ = progress_bars.hide();
+                    }
+                    children.handle_key(key, true).await;
+                    if was_open && !children.is_open() {
+                        render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                    }
+                }
+                _ = refresh_children.tick(), if children.is_open() => {
+                    children.refresh(true).await;
+                }
                 result = stream.next() => {
                     match result {
                         Some(Ok(AgentEvent::Message(message))) => {
                             if first_token_at.is_none() && message_has_text(&message) {
                                 first_token_at = Some(Instant::now());
+                            }
+                            let needs_terminal = find_tool_confirmation(&message).is_some()
+                                || find_elicitation_request(&message).is_some()
+                                || output::get_credits_top_up_url(&message).is_some();
+                            if needs_terminal {
+                                children.suspend();
+                                render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                             }
                             if let Some(confirmation_request) = find_tool_confirmation(&message) {
                                 let selected_permission = if interactive {
@@ -1468,12 +1507,15 @@ impl CliSession {
                             } else {
                                 log_tool_metrics(&message, &self.messages);
                                 self.messages.push(message.clone());
+                                children.observe(&message);
 
                                 if interactive { output::hide_thinking() };
                                 let _ = progress_bars.hide();
 
                                 if is_stream_json_mode {
                                     emit_stream_event(&StreamEvent::Message { message: message.clone() });
+                                } else if children.is_open() {
+                                    deferred_messages.push(message);
                                 } else if !is_json_mode {
                                     output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                                     maybe_open_credits_top_up_url(
@@ -1488,6 +1530,7 @@ impl CliSession {
                             last_usage = Some(usage);
                         }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}
+                        Some(Ok(AgentEvent::McpNotification(_))) if children.is_open() => {}
                         Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
                             handle_mcp_notification(
                                 &extension_id,
@@ -1503,6 +1546,8 @@ impl CliSession {
                             self.messages = updated_conversation;
                         }
                         Some(Err(e)) => {
+                            children.suspend();
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                             if interactive || !is_stream_json_mode {
                                 handle_agent_error(&e, is_stream_json_mode);
                             }
@@ -1525,6 +1570,8 @@ impl CliSession {
                     }
                 }
                 _ = cancel_token_clone.cancelled() => {
+                    children.suspend();
+                    render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                     drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
                     drop(stream);
                     if let Err(e) = self.handle_interrupted_messages(true).await {
@@ -1534,6 +1581,13 @@ impl CliSession {
                 }
             }
         }
+        drop(children);
+        render_deferred(
+            &mut deferred_messages,
+            &mut markdown_buffer,
+            &mut thinking_header_shown,
+            self.debug,
+        );
 
         let terminal_error = headless_run_error(
             interactive,
@@ -2088,6 +2142,17 @@ async fn drain_stopped_run(
             Ok(AgentEvent::Usage(usage)) => *last_usage = Some(usage),
             _ => {}
         }
+    }
+}
+
+fn render_deferred(
+    messages: &mut Vec<Message>,
+    markdown_buffer: &mut streaming_buffer::MarkdownBuffer,
+    thinking_header_shown: &mut bool,
+    debug: bool,
+) {
+    for message in messages.drain(..) {
+        output::render_message_streaming(&message, markdown_buffer, thinking_header_shown, debug);
     }
 }
 

@@ -366,6 +366,7 @@ pub(crate) struct SessionListFilters<'a> {
     pub(crate) types: Option<&'a [SessionType]>,
     pub(crate) working_dir: Option<&'a Path>,
     pub(crate) keyword: Option<&'a str>,
+    pub(crate) parent_session_id: Option<&'a str>,
     pub(crate) only_sessions_with_messages: bool,
 }
 
@@ -532,6 +533,11 @@ impl SessionManager {
 
     pub async fn list_all_sessions(&self) -> Result<Vec<Session>> {
         self.storage.list_sessions_by_types(None).await
+    }
+
+    /// Subagent sessions delegated by `parent_id`, oldest first, with their latest message snippet.
+    pub async fn list_child_sessions(&self, parent_id: &str) -> Result<Vec<Session>> {
+        self.storage.list_child_sessions(parent_id).await
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<()> {
@@ -2271,6 +2277,9 @@ impl SessionStorage {
         if filters.working_dir.is_some() {
             where_clauses.push("s.working_dir = ?".to_string());
         }
+        if filters.parent_session_id.is_some() {
+            where_clauses.push("s.parent_session_id = ?".to_string());
+        }
         if !keywords.is_empty() {
             where_clauses.push(message_keyword_clause(keywords.len()));
         }
@@ -2347,6 +2356,9 @@ impl SessionStorage {
         }
         if let Some(working_dir) = filters.working_dir {
             q = q.bind(working_dir.to_string_lossy().to_string());
+        }
+        if let Some(parent_session_id) = filters.parent_session_id {
+            q = q.bind(parent_session_id);
         }
         for term in keywords {
             q = q.bind(term);
@@ -2466,6 +2478,23 @@ impl SessionStorage {
     async fn list_sessions(&self) -> Result<Vec<Session>> {
         self.list_sessions_by_types(Some(&[SessionType::User, SessionType::Scheduled]))
             .await
+    }
+
+    async fn list_child_sessions(&self, parent_id: &str) -> Result<Vec<Session>> {
+        let mut sessions = self
+            .list_sessions_matching(SessionListQuery {
+                filters: SessionListFilters {
+                    types: Some(&[SessionType::SubAgent]),
+                    parent_session_id: Some(parent_id),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await?;
+        sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        let pool = self.pool().await?;
+        super::last_message_snippet::hydrate_last_message_snippets(pool, &mut sessions).await?;
+        Ok(sessions)
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<()> {
@@ -4474,6 +4503,7 @@ mod tests {
             working_dir: Some(Path::new("/tmp/session-list/a")),
             keyword: Some("postgres"),
             only_sessions_with_messages: true,
+            ..Default::default()
         };
         let cursor = sm
             .list_sessions_paged(SessionListPageQuery {
@@ -5036,6 +5066,57 @@ mod tests {
         insert_usage_ledger_row(&mut tx, session_id, None, usage).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_child_sessions_returns_only_direct_subagents_oldest_first() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let parent = new_session(&sm).await;
+        let mut children = Vec::new();
+        for name in ["first", "second"] {
+            let child = sm
+                .create_session(
+                    PathBuf::from("/tmp"),
+                    name.to_string(),
+                    SessionType::SubAgent,
+                    GooseMode::default(),
+                )
+                .await
+                .unwrap()
+                .id;
+            sm.update(&child)
+                .parent_session_id(Some(parent.clone()))
+                .apply()
+                .await
+                .unwrap();
+            children.push(child);
+        }
+        sm.add_message(&children[1], &Message::assistant().with_text("latest step"))
+            .await
+            .unwrap();
+        let grandchild = new_session(&sm).await;
+        sm.update(&grandchild)
+            .parent_session_id(Some(children[0].clone()))
+            .apply()
+            .await
+            .unwrap();
+
+        let listed = sm.list_child_sessions(&parent).await.unwrap();
+
+        assert_eq!(
+            listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            children.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            listed[1].last_message_snippet.as_deref(),
+            Some("latest step")
+        );
+        assert!(sm
+            .list_child_sessions(&children[1])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

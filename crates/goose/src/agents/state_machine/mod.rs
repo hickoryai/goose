@@ -23,6 +23,7 @@ mod ops_status;
 mod ops_steer;
 mod ops_stop_hook;
 mod ops_subagent;
+pub use ops_subagent::{subagent_states, SubagentState};
 mod ops_tool_approval;
 mod ops_tool_pair_compaction;
 mod ops_toolcalling;

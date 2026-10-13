@@ -92,6 +92,53 @@ fn pending_subagents(messages: &[Message]) -> Vec<String> {
     pending
 }
 
+/// Where a delegated subagent stands, as recorded in its parent's history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentState {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Reads every delegated subagent's state from the parent's persisted messages.
+pub fn subagent_states(parent_messages: &[Message]) -> HashMap<String, SubagentState> {
+    let mut states = HashMap::new();
+    for message in parent_messages {
+        for subagent_id in delegated_subagent_ids(&message.content) {
+            states
+                .entry(subagent_id.to_owned())
+                .or_insert(SubagentState::Running);
+        }
+        if let Some(subagent_id) = message
+            .metadata
+            .operation_note(OPERATION_NAME, DELIVERED)
+            .and_then(serde_json::Value::as_str)
+        {
+            let failed = message
+                .as_concat_text()
+                .starts_with(&format!("{} failed:", subagent_label(subagent_id)));
+            let state = if failed {
+                SubagentState::Failed
+            } else {
+                SubagentState::Completed
+            };
+            states.insert(subagent_id.to_owned(), state);
+        }
+        for subagent_id in message
+            .metadata
+            .operation_note(OPERATION_NAME, CANCELLED)
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+        {
+            states.insert(subagent_id.to_owned(), SubagentState::Cancelled);
+        }
+    }
+    states
+}
+
 fn readable_output(output: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(output) {
         Ok(serde_json::Value::Object(fields)) if fields.len() == 1 => fields
@@ -492,6 +539,49 @@ mod tests {
             messages.push(message);
         }
         assert_eq!(pending_subagents(&messages), ["waiting"]);
+    }
+
+    #[test]
+    fn subagent_states_follow_the_parent_history() {
+        let delivered = |subagent_id: &str, text: String| {
+            let mut message = Message::user().with_text(text);
+            message.metadata.set_operation_note(
+                OPERATION_NAME,
+                DELIVERED,
+                serde_json::json!(subagent_id),
+            );
+            message
+        };
+        let mut cancelled = Message::user().with_text("cancelled");
+        cancelled.metadata.set_operation_note(
+            OPERATION_NAME,
+            CANCELLED,
+            serde_json::json!(["stopped"]),
+        );
+        let messages = vec![
+            delegate_message("done"),
+            delegate_message("broken"),
+            delegate_message("stopped"),
+            delegate_message("busy"),
+            delivered("done", format!("{} completed: ok", subagent_label("done"))),
+            delivered(
+                "broken",
+                format!("{} failed: boom", subagent_label("broken")),
+            ),
+            cancelled,
+        ];
+
+        let states = subagent_states(&messages);
+
+        assert_eq!(
+            states,
+            HashMap::from([
+                ("done".to_string(), SubagentState::Completed),
+                ("broken".to_string(), SubagentState::Failed),
+                ("stopped".to_string(), SubagentState::Cancelled),
+                ("busy".to_string(), SubagentState::Running),
+            ])
+        );
     }
 
     #[test]

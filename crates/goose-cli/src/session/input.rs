@@ -27,6 +27,7 @@ pub enum InputResult {
     Clear,
     New,
     Compact,
+    Children,
     ToggleFullToolOutput,
     Edit(Option<String>),
     ListSkills,
@@ -232,6 +233,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_CLEAR: &str = "/clear";
     const CMD_NEW: &str = "/new";
     const CMD_COMPACT: &str = "/compact";
+    const CMD_CHILDREN: &str = "/children";
     const CMD_SUMMARIZE_DEPRECATED: &str = "/summarize";
     const CMD_EDIT: &str = "/edit";
     const CMD_EDIT_WITH_SPACE: &str = "/edit ";
@@ -324,6 +326,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_CLEAR => Some(InputResult::Clear),
         s if s == CMD_NEW => Some(InputResult::New),
         s if s == CMD_COMPACT => Some(InputResult::Compact),
+        s if s == CMD_CHILDREN => Some(InputResult::Children),
         // Match "/skills" exactly or "/skills " with args - avoids matching e.g. "/skillsextra"
         s if s == CMD_SKILLS || s.starts_with(&format!("{CMD_SKILLS} ")) => {
             let args = s.get(CMD_SKILLS.len()..).unwrap_or("").trim();
@@ -439,12 +442,14 @@ fn help_text() -> String {
 /? or /help - Display this help message
 /clear - Clears the current chat history
 /new - Start a fresh session in this process, keeping the current provider, model and extensions
+/children - Browse this session's subagent sessions (read-only)
 
 Navigation:
 Enter - Send message
 Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
 Ctrl+C - Clear current line if text is entered, otherwise exit the session
 Up/Down arrows - Navigate through command history
+Tab (while subagents run) - Open the read-only child session navigator; Tab, q or Esc closes it
 GOOSE_CLI_BELL=true - Ring the terminal bell when goose finishes a turn or needs approval"
     )
 }
@@ -504,6 +509,11 @@ mod tests {
         assert!(matches!(
             handle_slash_command("/quit"),
             Some(InputResult::Exit)
+        ));
+
+        assert!(matches!(
+            handle_slash_command("/children"),
+            Some(InputResult::Children)
         ));
 
         // Test help commands
