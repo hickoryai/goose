@@ -356,11 +356,6 @@ impl Layout {
         usize::from(self.input) + self.list
     }
 
-    /// The first child row's 0-based screen row (the header is the row above it).
-    fn list_top(self, lines: usize) -> Option<usize> {
-        (self.list > 0).then(|| lines - self.list + 1)
-    }
-
     fn child_slots(self) -> usize {
         self.list.saturating_sub(1)
     }
