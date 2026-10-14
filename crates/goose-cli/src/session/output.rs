@@ -1543,39 +1543,90 @@ pub fn display_session_info(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // ASCII art leaf with session info on the right
+    // kory's seedling with the session info beside its leaves
+    let info = [
+        format!(
+            "{} {} {} {} {}",
+            style("●").green(),
+            style(status).dim(),
+            style("·").dim(),
+            style(provider).dim(),
+            style(&model_display).cyan(),
+        ),
+        match session_id {
+            Some(id) => format!("{} {}", style(id).dim(), style(format!("· {cwd_display}")).dim()),
+            None => style(cwd_display).dim().to_string(),
+        },
+        format!("{}", style("🌱 kory is ready").white()),
+    ];
+    // A wrapped info line would split the seedling, so each fits beside it.
+    let room = (console::Term::stdout().size().1 as usize)
+        .saturating_sub(2 + SEEDLING[0].len() + 3)
+        .max(10);
     outln!();
-    outln!(
-        "  {}  {} {} {} {} {}",
-        style("   ,--.  ").green(),
-        style("●").green(),
-        style(status).dim(),
-        style("·").dim(),
-        style(provider).dim(),
-        style(&model_display).cyan(),
-    );
-
-    if let Some(id) = session_id {
-        outln!(
-            "  {}  {} {} {}",
-            style("  ( /  ) ").green(),
-            style(" ").dim(),
-            style(id).dim(),
-            style(format!("· {}", cwd_display)).dim(),
-        );
-    } else {
-        outln!(
-            "  {}  {} {}",
-            style("  ( /  ) ").green(),
-            style(" ").dim(),
-            style(format!("  {}", cwd_display)).dim(),
-        );
+    for (row, art) in seedling_rows().iter().enumerate() {
+        match row.checked_sub(1).and_then(|line| info.get(line)) {
+            Some(text) => outln!("  {art}   {}", console::truncate_str(text, room, "…")),
+            None => outln!("  {}", art.trim_end()),
+        }
     }
-    outln!(
-        "  {}  {}",
-        style("   `/--' ").green(),
-        style("   🍃 kory is ready").white()
-    );
+}
+
+/// kory's seedling, two pixels per text cell: `l` leaf, `d` midrib, `s` stem.
+const SEEDLING: [&str; 14] = [
+    "                    ",
+    "              lllll ",
+    "            lllldd  ",
+    "  ddlll    lllddll  ",
+    "  llddll   lldlll   ",
+    "   lllddl lddlll    ",
+    "    lllldllllll     ",
+    "         s          ",
+    "         ss         ",
+    "         ss         ",
+    "         ss         ",
+    "         ss         ",
+    "         ss         ",
+    "         s          ",
+];
+
+/// The seedling as half-block text rows, in true color when the terminal takes color.
+fn seedling_rows() -> Vec<String> {
+    let color = console::colors_enabled();
+    let rgb = |pixel: u8| match pixel {
+        b'l' => Some((129, 199, 132)),
+        b'd' => Some((56, 142, 60)),
+        b's' => Some((67, 160, 71)),
+        _ => None,
+    };
+    SEEDLING
+        .chunks(2)
+        .map(|pair| {
+            let (top, bottom) = (pair[0].as_bytes(), pair[1].as_bytes());
+            top.iter()
+                .zip(bottom)
+                .map(|(&t, &b)| seedling_cell(rgb(t), rgb(b), color))
+                .collect()
+        })
+        .collect()
+}
+
+fn seedling_cell(top: Option<(u8, u8, u8)>, bottom: Option<(u8, u8, u8)>, color: bool) -> String {
+    let fg = |(r, g, b): (u8, u8, u8)| format!("\x1b[38;2;{r};{g};{b}m");
+    let (glyph, paint) = match (top, bottom) {
+        (None, None) => return " ".into(),
+        (Some(t), None) => ("▀", fg(t)),
+        (None, Some(b)) => ("▄", fg(b)),
+        (Some(t), Some(b)) if t == b => ("█", fg(t)),
+        (Some(t), Some((r, g, b))) => ("▀", format!("{}\x1b[48;2;{r};{g};{b}m", fg(t))),
+    };
+    if color {
+        format!("{paint}{glyph}\x1b[0m")
+    } else if top.is_some() && bottom.is_some() {
+        "█".into()
+    } else {
+        glyph.into()
+    }
 }
 
 fn set_terminal_title() {
@@ -1589,7 +1640,7 @@ fn set_terminal_title() {
     // Sanitize: strip control characters (ESC, BEL, etc.) to prevent terminal escape injection
     let sanitized: String = dir_name.chars().filter(|c| !c.is_control()).collect();
     // OSC 0 sets the terminal window/tab title
-    out!("\x1b]0;🍃 {}\x07", sanitized);
+    out!("\x1b]0;🌱 {}\x07", sanitized);
     let _ = std::io::stdout().flush();
 }
 
