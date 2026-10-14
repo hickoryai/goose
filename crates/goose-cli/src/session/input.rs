@@ -29,6 +29,8 @@ pub enum InputResult {
     New,
     Compact,
     Children,
+    /// ↓ on an empty prompt: move into the child dock.
+    DockFocus,
     ToggleFullToolOutput,
     Edit(Option<String>),
     ListSkills,
@@ -84,6 +86,23 @@ impl rustyline::ConditionalEventHandler for CtrlCHandler {
 
             Some(rustyline::Cmd::Repaint)
         }
+    }
+}
+
+/// ↓ on an empty line moves into the child dock when it lists children; otherwise ↓ keeps
+/// its history meaning.
+struct DockFocusHandler;
+
+impl rustyline::ConditionalEventHandler for DockFocusHandler {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: u16,
+        _positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        (ctx.line().is_empty() && super::child_sessions::dock::request_focus())
+            .then_some(rustyline::Cmd::AcceptLine)
     }
 }
 
@@ -183,6 +202,11 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Down, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(DockFocusHandler)),
+    );
+
     // Background agent output prints above the line being edited only while it is edited.
     if let Some(relay) = background_output {
         relay.resume();
@@ -190,6 +214,9 @@ pub fn get_input(
     let read = read_paste_aware_input(editor, paste_state);
     if let Some(relay) = background_output {
         relay.pause();
+    }
+    if super::child_sessions::dock::take_focus_request() {
+        return Ok(InputResult::DockFocus);
     }
     let input = match read {
         Ok(text) => text,

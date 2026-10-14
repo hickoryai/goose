@@ -253,9 +253,8 @@ pub struct CliSession {
     loading_announced: bool,
     /// Records (and at the prompt, shows) what the agent says while no turn of ours runs.
     unsolicited: Option<unsolicited::UnsolicitedRelay>,
-    /// Prints router-acp planner workers' status at the prompt: the router session it
-    /// watches and the watcher.
-    router_status: Option<(String, AbortOnDropHandle<()>)>,
+    /// The persistent child list under the prompt, and the router session it follows.
+    dock: Option<(Option<String>, child_sessions::dock::Dock)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,7 +340,7 @@ impl CliSession {
             extension_loading,
             loading_announced: false,
             unsolicited: None,
-            router_status: None,
+            dock: None,
         }
     }
 
@@ -556,6 +555,11 @@ impl CliSession {
         cancel_token: CancellationToken,
         interactive: bool,
     ) -> Result<()> {
+        // Typing may start as soon as the message is sent; keep it off the output until the
+        // turn's footer input reads it.
+        let _quiet = self
+            .dock()
+            .and_then(|_| child_sessions::EchoOff::start());
         self.ensure_extensions_loaded(interactive).await?;
         let cancel_token = cancel_token.clone();
         self.sync_unsolicited(None).await;
@@ -623,6 +627,10 @@ impl CliSession {
 
             self.display_context_usage().await?;
             self.sync_unsolicited(Some(&mut editor)).await;
+            let queued = self.dock().and_then(|dock| {
+                dock.end_turn();
+                dock.take_queued()
+            });
 
             let conversation_strings: Vec<String> = self
                 .messages
@@ -636,6 +644,19 @@ impl CliSession {
                     format!("## {}: {}", role, msg.as_concat_text())
                 })
                 .collect();
+
+            // Messages typed during the last turn go out as soon as it ends.
+            if let Some(queued) = queued {
+                println!("{} {}", console::style(">").cyan(), queued);
+                self.handle_input(
+                    InputResult::Message(queued),
+                    &history_manager,
+                    &mut editor,
+                    &conversation_strings,
+                )
+                .await?;
+                continue;
+            }
 
             output::run_status_hook("waiting");
             let input = input::get_input(
@@ -749,6 +770,7 @@ impl CliSession {
                 history.save(editor);
                 self.child_navigator(true).await.browse().await;
             }
+            InputResult::DockFocus => self.focus_dock().await,
             InputResult::Edit(prefill) => {
                 history.save(editor);
                 match crate::session::editor::resolve_editor_command() {
@@ -1365,6 +1387,14 @@ impl CliSession {
         let mut children = self
             .child_navigator(interactive && !is_json_mode && !is_stream_json_mode)
             .await;
+        // Typing during the turn: the footer's input line takes keys, and Ctrl+Enter is only
+        // reported once the terminal's extended keyboard reporting is on.
+        let mut extended_keys = None;
+        if let Some(dock) = self.dock() {
+            dock.begin_turn();
+            children.listen_for_input();
+            extended_keys = child_sessions::dock::ExtendedKeys::enable();
+        }
         let mut deferred_messages: Vec<Message> = Vec::new();
         let mut refresh_children = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
 
@@ -1372,6 +1402,49 @@ impl CliSession {
         loop {
             tokio::select! {
                 key = children.next_key() => {
+                    // With the navigator closed, keys drive the footer: arrows, Enter and clicks
+                    // the dock; everything else the input line.
+                    if !children.is_open() {
+                        if let Some(dock) = self.dock() {
+                            use child_sessions::Key;
+                            let chosen = match key {
+                                Key::Interrupt => {
+                                    cancel_token_clone.cancel();
+                                    None
+                                }
+                                Key::Open => {
+                                    children.handle_key(key, true).await;
+                                    None
+                                }
+                                Key::Up if dock.is_selecting() => {
+                                    dock.step(-1);
+                                    None
+                                }
+                                Key::Down if dock.has_rows() => {
+                                    dock.step(1);
+                                    None
+                                }
+                                Key::Enter if dock.is_selecting() => dock.selected(),
+                                Key::Escape if dock.is_selecting() => {
+                                    dock.clear_selection();
+                                    None
+                                }
+                                Key::Click { row, .. } => dock.select_row(row),
+                                key => {
+                                    if dock.type_key(key) == child_sessions::dock::Typed::SendNow {
+                                        cancel_token_clone.cancel();
+                                    }
+                                    None
+                                }
+                            };
+                            if let Some(child) = chosen {
+                                output::hide_thinking();
+                                let _ = progress_bars.hide();
+                                children.open_at(&child, true).await;
+                            }
+                            continue;
+                        }
+                    }
                     let was_open = children.is_open();
                     if !was_open {
                         output::hide_thinking();
@@ -1399,6 +1472,7 @@ impl CliSession {
                                 || find_elicitation_request(&message).is_some()
                                 || output::get_credits_top_up_url(&message).is_some();
                             if needs_terminal {
+                                drop(extended_keys.take());
                                 children.suspend();
                                 render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                             }
@@ -2081,6 +2155,9 @@ impl CliSession {
         &mut self,
         editor: Option<&mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>>,
     ) {
+        // Only the interactive prompt (which passes its editor) decides the footer; a turn
+        // started from it calls this without one and must keep it.
+        let at_prompt = editor.is_some();
         let session_manager = self.agent.config.session_manager.clone();
         let provider = match session_manager.get_session(&self.session_id, false).await {
             Ok(session) => self.agent.config.providers.pinned(&session).await,
@@ -2093,7 +2170,7 @@ impl CliSession {
                 .is_some_and(|provider| relay.follows(provider, &self.session_id))
                 && (display.is_none() || relay.displays())
         });
-        let replaced = !current && provider.is_some();
+        let interactive = display.is_some();
         if let (false, Some(provider)) = (current, provider) {
             if let Some(previous) = self.unsolicited.take() {
                 previous.settle().await;
@@ -2115,39 +2192,78 @@ impl CliSession {
             );
         }
         self.take_unsolicited();
-        self.sync_router_status(replaced).await;
+        if at_prompt {
+            self.sync_dock(interactive).await;
+        }
     }
 
-    /// Keeps the prompt-time worker status following the router session this goose session
-    /// runs in, printed through the background-output relay.
-    async fn sync_router_status(&mut self, relay_replaced: bool) {
-        let notifier = self
-            .unsolicited
-            .as_ref()
-            .filter(|relay| relay.displays())
-            .map(|relay| relay.notifier());
-        let root = match notifier {
-            Some(_) => self.router_session_id().await,
-            None => None,
-        };
-        let (Some(notifier), Some(root)) = (notifier, root) else {
-            self.router_status = None;
-            return;
-        };
-        if !relay_replaced
-            && self
-                .router_status
-                .as_ref()
-                .is_some_and(|(id, _)| *id == root)
-        {
+    /// Keeps the child dock following the router session this goose session runs in. Only an
+    /// interactive text prompt has one.
+    async fn sync_dock(&mut self, interactive: bool) {
+        if !interactive || !child_sessions::dock::is_capable() {
+            self.dock = None;
             return;
         }
-        self.router_status = RouterStateSource::configured().ok().map(|source| {
-            let watch = child_sessions::router::watch_status(source, root.clone(), move |line| {
-                notifier.notice(console::style(line).dim().to_string())
-            });
-            (root, watch)
+        let root = self.router_session_id().await;
+        if self.dock.as_ref().is_some_and(|(id, _)| *id == root) {
+            return;
+        }
+        self.dock = None;
+        let router = root
+            .clone()
+            .and_then(|id| RouterStateSource::configured().ok().map(|source| (source, id)));
+        let dock = child_sessions::dock::Dock::start(child_sessions::dock::Sources {
+            session_manager: self.agent.config.session_manager.clone(),
+            session_id: self.session_id.clone(),
+            router,
         });
+        self.dock = Some((root, dock));
+    }
+
+    fn dock(&self) -> Option<&child_sessions::dock::Dock> {
+        self.dock.as_ref().map(|(_, dock)| dock)
+    }
+
+    /// ↓ on an empty prompt: ↑/↓ choose a child, Enter (or a click) opens it in the
+    /// navigator, Esc or ↑ past the first row returns to the prompt.
+    async fn focus_dock(&mut self) {
+        let Some(dock) = self.dock() else {
+            return;
+        };
+        if !dock.step(1) {
+            return;
+        }
+        let mut navigator = self.child_navigator(true).await;
+        let Ok(mut keys) = child_sessions::KeyReader::start() else {
+            dock.clear_selection();
+            return;
+        };
+        while let Some(key) = keys.next().await {
+            let Some(dock) = self.dock() else { break };
+            let chosen = match key {
+                child_sessions::Key::Up if !dock.step(-1) => break,
+                child_sessions::Key::Up => None,
+                child_sessions::Key::Down => {
+                    dock.step(1);
+                    None
+                }
+                child_sessions::Key::Enter => dock.selected(),
+                child_sessions::Key::Click { row, .. } => dock.select_row(row),
+                child_sessions::Key::Escape | child_sessions::Key::Char('q') => break,
+                _ => None,
+            };
+            if let Some(child) = chosen {
+                drop(keys);
+                navigator.browse_at(&child).await;
+                keys = match child_sessions::KeyReader::start() {
+                    Ok(keys) => keys,
+                    Err(_) => break,
+                };
+            }
+        }
+        if let Some(dock) = self.dock() {
+            dock.clear_selection();
+        }
     }
 
     /// The navigator over this session's children, including the delegates router-acp runs

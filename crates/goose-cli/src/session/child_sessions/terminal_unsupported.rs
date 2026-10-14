@@ -4,6 +4,14 @@ pub fn is_capable() -> bool {
     false
 }
 
+pub struct EchoOff;
+
+impl EchoOff {
+    pub fn start() -> Option<Self> {
+        None
+    }
+}
+
 pub struct KeyListener;
 
 impl KeyListener {
