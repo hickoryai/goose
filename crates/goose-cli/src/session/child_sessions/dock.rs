@@ -47,6 +47,8 @@ struct State {
     /// mid-turn and rows can only be reserved on a fresh line.
     always_list: bool,
     selected: Option<usize>,
+    /// The first child row shown; follows the selection through a longer list.
+    offset: usize,
     input: Option<InputLine>,
     queued: Vec<String>,
     /// Text typed during a turn that was never sent; it fills the next prompt.
@@ -209,6 +211,7 @@ impl Dock {
         let selecting = {
             let mut state = self.shared.state.lock().unwrap();
             state.selected = next_selection(state.selected, state.rows.len(), delta);
+            follow_selection(&mut state);
             state.selected.is_some()
         };
         set_mouse(selecting);
@@ -217,7 +220,11 @@ impl Dock {
     }
 
     pub fn clear_selection(&self) {
-        self.shared.state.lock().unwrap().selected = None;
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            state.selected = None;
+            follow_selection(&mut state);
+        }
         set_mouse(false);
         self.shared.paint();
     }
@@ -226,14 +233,13 @@ impl Dock {
     pub fn select_row(&self, row: u16) -> Option<ChildRow> {
         let child = {
             let mut state = self.shared.state.lock().unwrap();
-            let layout = Layout::of(&state, state.size.1);
-            let first_child = layout.list_top(state.size.1)?;
-            let index = (row as usize).checked_sub(first_child)?;
-            let child = state
-                .rows
-                .get(index)
-                .filter(|_| index < layout.child_slots())?
-                .clone();
+            let lines = state.size.1;
+            let layout = shown_layout(&state, lines);
+            let first_child = lines.checked_sub(state.reserved)? + usize::from(layout.input) + 1;
+            let slot = (row as usize).checked_sub(first_child)?;
+            let (shown, _) = window(&state, layout);
+            let index = state.offset + slot;
+            let child = state.rows.get(index).filter(|_| slot < shown)?.clone();
             state.selected = Some(index);
             child
         };
@@ -372,6 +378,7 @@ impl Shared {
                     .filter(|_| !rows.is_empty());
             }
             state.rows = rows;
+            follow_selection(&mut state);
         }
         self.follow_resize();
         self.paint();
@@ -442,7 +449,7 @@ impl Shared {
 }
 
 fn next_selection(selected: Option<usize>, rows: usize, delta: isize) -> Option<usize> {
-    let last = rows.saturating_sub(1).min(MAX_ROWS - 1);
+    let last = rows.saturating_sub(1);
     match selected {
         _ if rows == 0 => None,
         None if delta > 0 => Some(0),
@@ -470,12 +477,38 @@ fn release_sequence(height: usize, lines: usize) -> String {
 /// One write that paints every footer row and puts the cursor back where the output left it.
 /// The rows are laid out within what is reserved, which may be less than the layout wants
 /// until the next fresh line lets the footer grow.
-fn frame(state: &State, cols: usize, lines: usize) -> String {
+/// The layout as painted: what the layout wants, within what is reserved until the next fresh
+/// line lets the footer grow.
+fn shown_layout(state: &State, lines: usize) -> Layout {
     let mut layout = Layout::of(state, lines);
     if layout.height() > state.reserved {
         layout.input &= state.reserved > 0;
         layout.list = state.reserved - usize::from(layout.input);
     }
+    layout
+}
+
+/// How many child rows fit, and whether the last slot instead says what is out of view.
+fn window(state: &State, layout: Layout) -> (usize, bool) {
+    let slots = layout.child_slots();
+    let overflow = state.rows.len() > slots;
+    (if overflow { slots.saturating_sub(1) } else { slots }, overflow)
+}
+
+/// Scrolls the list so the selected child is shown; without a selection it shows the top.
+fn follow_selection(state: &mut State) {
+    let (shown, _) = window(state, shown_layout(state, state.size.1));
+    state.offset = match state.selected {
+        None => 0,
+        Some(selected) if selected < state.offset => selected,
+        Some(selected) if shown > 0 && selected >= state.offset + shown => selected + 1 - shown,
+        Some(_) => state.offset,
+    };
+    state.offset = state.offset.min(state.rows.len().saturating_sub(shown));
+}
+
+fn frame(state: &State, cols: usize, lines: usize) -> String {
+    let layout = shown_layout(state, lines);
     let mut row = lines.saturating_sub(state.reserved) + 1;
     let mut out = String::from("\x1b7");
     let mut line = |out: &mut String, text: String| {
@@ -488,18 +521,25 @@ fn frame(state: &State, cols: usize, lines: usize) -> String {
     if layout.list > 0 {
         line(&mut out, header(state, cols));
         let slots = layout.child_slots();
-        let overflow = state.rows.len() > slots;
-        let shown = if overflow { slots.saturating_sub(1) } else { slots };
+        let (shown, overflow) = window(state, layout);
         for slot in 0..slots {
-            let text = match state.rows.get(slot) {
+            let index = state.offset + slot;
+            let text = match state.rows.get(index) {
                 Some(child) if slot < shown => {
-                    view::child_row(child, state.selected == Some(slot), cols)
+                    view::child_row(child, state.selected == Some(index), cols)
                 }
                 _ if overflow && slot == shown => {
-                    let more = state.rows.len() - shown;
-                    style(format!("  +{more} more · /children for all"))
-                        .dim()
-                        .to_string()
+                    let above = state.offset;
+                    let below = state.rows.len().saturating_sub(state.offset + shown);
+                    let mut parts = Vec::new();
+                    if above > 0 {
+                        parts.push(format!("↑ {above} above"));
+                    }
+                    if below > 0 {
+                        parts.push(format!("↓ {below} more"));
+                    }
+                    parts.push("/children for all".to_string());
+                    style(format!("  {}", parts.join(" · "))).dim().to_string()
                 }
                 _ => String::new(),
             };
@@ -606,6 +646,9 @@ fn terminal_size() -> (usize, usize) {
 /// Mouse reporting only while a dock row is selected, so the wheel and text selection keep
 /// working on the terminal's scrollback the rest of the time.
 fn set_mouse(on: bool) {
+    if !is_capable() {
+        return;
+    }
     write_raw(if on {
         "\x1b[?1000h\x1b[?1006h"
     } else {
@@ -677,6 +720,28 @@ mod tests {
     }
 
     #[test]
+    fn the_list_scrolls_to_keep_the_selection_in_view() {
+        let mut state = State {
+            rows: (0..10).map(|i| row(&i.to_string(), ChildStatus::Running)).collect(),
+            reserved: 4,
+            size: (80, 30),
+            ..State::default()
+        };
+        // 4 rows: header, two children, and the "out of view" row.
+        for _ in 0..6 {
+            state.selected = next_selection(state.selected, state.rows.len(), 1);
+            follow_selection(&mut state);
+        }
+        assert_eq!((state.selected, state.offset), (Some(5), 4));
+        let plain = console::strip_ansi_codes(&frame(&state, 80, 30)).to_string();
+        assert!(plain.contains("› running   5"), "{plain}");
+        assert!(plain.contains("↑ 4 above · ↓ 4 more"), "{plain}");
+        state.selected = None;
+        follow_selection(&mut state);
+        assert_eq!(state.offset, 0);
+    }
+
+    #[test]
     fn more_children_than_rows_collapse_into_a_count() {
         let state = State {
             rows: (0..5).map(|i| row(&i.to_string(), ChildStatus::Running)).collect(),
@@ -684,7 +749,7 @@ mod tests {
             size: (80, 30),
             ..State::default()
         };
-        assert!(console::strip_ansi_codes(&frame(&state, 80, 30)).contains("+4 more"));
+        assert!(console::strip_ansi_codes(&frame(&state, 80, 30)).contains("↓ 4 more"));
     }
 
     #[test]
@@ -692,6 +757,7 @@ mod tests {
         assert_eq!(next_selection(None, 2, 1), Some(0));
         assert_eq!(next_selection(Some(0), 2, 1), Some(1));
         assert_eq!(next_selection(Some(1), 2, 1), Some(1));
+        assert_eq!(next_selection(Some(7), 9, 1), Some(8), "no cap at the visible rows");
         assert_eq!(next_selection(Some(1), 2, -1), Some(0));
         assert_eq!(next_selection(Some(0), 2, -1), None);
         assert_eq!(next_selection(None, 0, 1), None);
