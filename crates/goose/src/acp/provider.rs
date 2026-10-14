@@ -29,7 +29,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as TokioMutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
 use crate::acp::handoff::{build_handoff_context_memo, memo_token_budget, prompt_token_cost};
@@ -38,7 +38,7 @@ use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY};
 use crate::permission::permission_confirmation::PrincipalType;
 use crate::permission::{Permission, PermissionConfirmation};
-use crate::providers::base::{MessageStream, PermissionRouting, Provider};
+use crate::providers::base::{MessageStream, PermissionRouting, Provider, UnsolicitedUpdate};
 use crate::subprocess::configure_subprocess;
 use crate::token_counter::create_token_counter;
 use crate::utils::sanitize_unicode_tags;
@@ -160,6 +160,141 @@ enum AcpUpdate {
     },
     Complete(StopReason, Option<AcpUsage>),
     Error(agent_client_protocol::Error),
+}
+
+const UNSOLICITED_CAPACITY: usize = 1024;
+/// A quiet stretch this long closes the unsolicited output streamed so far, so subscribers
+/// can record it and later chunks start new messages.
+const UNSOLICITED_SETTLE_AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
+
+#[derive(Debug)]
+enum Unsolicited {
+    Update(Box<AcpUpdate>),
+    /// A prompt is starting: whatever streamed before it is complete.
+    Settle,
+}
+
+/// Groups contiguous chunks under one id and timestamp so they coalesce into one message.
+#[derive(Default)]
+struct UpdateRuns {
+    text: Option<(String, i64)>,
+    thought: Option<(String, i64)>,
+}
+
+impl UpdateRuns {
+    fn text(&mut self, text: TextContent) -> Message {
+        let (id, ts) = self.text.get_or_insert_with(fresh_text_run).clone();
+        acp_text_update_message(text, id, ts)
+    }
+
+    fn thought(&mut self, text: String) -> Message {
+        let (id, ts) = self.thought.get_or_insert_with(fresh_text_run).clone();
+        Message::new(Role::Assistant, ts, vec![])
+            .with_thinking(text, "")
+            .with_visibility(true, false)
+            .with_id(id)
+    }
+
+    fn end(&mut self) {
+        self.text = None;
+        self.thought = None;
+    }
+}
+
+fn tool_request_message(
+    id: String,
+    name: String,
+    kind: ToolKind,
+    raw_input: Option<serde_json::Value>,
+) -> Message {
+    let mut params = CallToolRequestParams::new(name);
+    if let Some(serde_json::Value::Object(map)) = raw_input {
+        params = params.with_arguments(map);
+    }
+    // external_dispatch tells the agent loop not to redispatch this call. goose.acp.kind
+    // preserves ACP's stable categorization for downstream consumers (metrics,
+    // observability, icon selection) independent of the display title we put in `name`.
+    let tool_meta = Some(serde_json::json!({
+        TOOL_META_EXTERNAL_DISPATCH_KEY: true,
+        "goose.acp.kind": kind,
+    }));
+    Message::assistant().with_tool_request_with_metadata(id, Ok(params), None, tool_meta)
+}
+
+fn tool_response_message(
+    id: String,
+    raw_output: Option<serde_json::Value>,
+    content: Option<Vec<ToolCallContent>>,
+    is_error: bool,
+) -> Message {
+    let result_content = acp_tool_call_content_to_rmcp(content, raw_output);
+    let result = if is_error {
+        CallToolResult::error(result_content)
+    } else {
+        CallToolResult::success(result_content)
+    };
+    Message::user().with_tool_response(id, Ok(result))
+}
+
+/// Turns updates that arrive with no prompt in flight into the same messages `stream`
+/// yields, and marks each burst complete once the agent goes quiet or a prompt starts.
+async fn relay_unsolicited(
+    mut rx: mpsc::UnboundedReceiver<Unsolicited>,
+    subscribers: broadcast::Sender<UnsolicitedUpdate>,
+) {
+    let mut runs = UpdateRuns::default();
+    let mut unsettled = false;
+    loop {
+        let next = if unsettled {
+            match tokio::time::timeout(UNSOLICITED_SETTLE_AFTER, rx.recv()).await {
+                Ok(next) => next,
+                Err(_) => Some(Unsolicited::Settle),
+            }
+        } else {
+            rx.recv().await
+        };
+        let message = match next {
+            None => break,
+            Some(Unsolicited::Settle) => {
+                if unsettled {
+                    runs.end();
+                    unsettled = false;
+                    let _ = subscribers.send(UnsolicitedUpdate::Settled);
+                }
+                continue;
+            }
+            Some(Unsolicited::Update(update)) => match *update {
+                AcpUpdate::Text(text) => runs.text(text),
+                AcpUpdate::Thought(text) => runs.thought(text),
+                AcpUpdate::ToolCallStart {
+                    id,
+                    name,
+                    kind,
+                    raw_input,
+                } => {
+                    runs.end();
+                    tool_request_message(id, name, kind, raw_input)
+                }
+                AcpUpdate::ToolCallComplete {
+                    id,
+                    raw_output,
+                    content,
+                    is_error,
+                } => {
+                    runs.end();
+                    tool_response_message(id, raw_output, content, is_error)
+                }
+                AcpUpdate::PermissionRequest { .. }
+                | AcpUpdate::Complete(..)
+                | AcpUpdate::Error(_) => continue,
+            },
+        };
+        unsettled = true;
+        let _ = subscribers.send(UnsolicitedUpdate::Message(message));
+    }
+    if unsettled {
+        let _ = subscribers.send(UnsolicitedUpdate::Settled);
+    }
 }
 
 /// Whether dropping the handoff memo could plausibly change the outcome. An agent that
@@ -302,6 +437,11 @@ pub struct AcpProvider {
     /// switch), so the persisted value is re-applied when that happens.
     effort: AcpEffortState,
 
+    /// Updates the agent sends while no prompt is in flight, e.g. turns a router starts on
+    /// the session by itself after goose's turn ended.
+    unsolicited: broadcast::Sender<UnsolicitedUpdate>,
+    unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
+
     tx: Option<mpsc::Sender<ClientRequest>>,
     cancel_tx: Option<oneshot::Sender<()>>,
     loop_thread: Option<JoinHandle<()>>,
@@ -398,12 +538,16 @@ impl AcpProvider {
             Arc::new(Mutex::new(HashMap::new()));
         let context_size = Arc::new(AtomicU64::new(0));
         let effort = AcpEffortState::new();
+        let (unsolicited_tx, unsolicited_rx) = mpsc::unbounded_channel();
+        let (unsolicited, _) = broadcast::channel(UNSOLICITED_CAPACITY);
+        tokio::spawn(relay_unsolicited(unsolicited_rx, unsolicited.clone()));
         let client_loop = AcpClientLoop::new(
             config,
             goose_mode_shared.clone(),
             pending_tool_updates.clone(),
             context_size.clone(),
             effort.clone(),
+            unsolicited_tx.clone(),
         );
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx, cancel_rx));
@@ -449,6 +593,8 @@ impl AcpProvider {
             model_config_option_id,
             applied_model: Arc::new(Mutex::new(applied_model)),
             effort,
+            unsolicited,
+            unsolicited_tx,
             tx: client_loop_guard.tx.take(),
             cancel_tx: client_loop_guard.cancel_tx.take(),
             loop_thread: client_loop_guard.thread.take(),
@@ -757,6 +903,10 @@ impl Provider for AcpProvider {
         Some(self.effort.updates.subscribe())
     }
 
+    fn subscribe_unsolicited(&self) -> Option<broadcast::Receiver<UnsolicitedUpdate>> {
+        Some(self.unsolicited.subscribe())
+    }
+
     async fn set_thinking_effort(
         &self,
         session_id: &str,
@@ -867,6 +1017,7 @@ impl Provider for AcpProvider {
             ),
             None => (current_prompt_blocks, None),
         };
+        let _ = self.unsolicited_tx.send(Unsolicited::Settle);
         // Drop any tool-call buffer state left over from a prior prompt
         // (e.g. cancelled or interrupted before its terminal status arrived).
         if let Ok(mut buffer) = self.pending_tool_updates.lock() {
@@ -915,57 +1066,26 @@ impl Provider for AcpProvider {
             let mut updates_seen = 0usize;
             let mut rejected_tool_calls: HashSet<String> = HashSet::new();
             // Stable id+timestamp per contiguous run so Desktop coalesces chunks into one bubble.
-            let mut text_run: Option<(String, i64)> = None;
-            let mut thought_run: Option<(String, i64)> = None;
+            let mut runs = UpdateRuns::default();
 
             while let Some(update) = rx.recv().await {
                 updates_seen += 1;
                 match update {
                     AcpUpdate::Text(text) => {
                         if !suppress_text {
-                            let (id, ts) = text_run
-                                .get_or_insert_with(fresh_text_run)
-                                .clone();
-                            let message = acp_text_update_message(text, id, ts);
-                            yield (Some(message), None);
+                            yield (Some(runs.text(text)), None);
                         }
                     }
                     AcpUpdate::Thought(text) => {
-                        let (id, ts) = thought_run
-                            .get_or_insert_with(fresh_text_run)
-                            .clone();
-                        let message = Message::new(Role::Assistant, ts, vec![])
-                            .with_thinking(text, "")
-                            .with_visibility(true, false)
-                            .with_id(id);
-                        yield (Some(message), None);
+                        yield (Some(runs.thought(text)), None);
                     }
                     AcpUpdate::ToolCallStart { id, name, kind, raw_input } => {
-                        text_run = None;
-                        thought_run = None;
+                        runs.end();
                         if reject_all_tools {
                             suppress_text = true;
                             rejected_tool_calls.insert(id);
                         } else {
-                            let mut params = CallToolRequestParams::new(name);
-                            if let Some(serde_json::Value::Object(map)) = raw_input {
-                                params = params.with_arguments(map);
-                            }
-                            // external_dispatch tells the agent loop not to redispatch this
-                            // call. goose.acp.kind preserves ACP's stable categorization for
-                            // downstream consumers (metrics, observability, icon selection)
-                            // independent of the display title we put in `name`.
-                            let tool_meta = Some(serde_json::json!({
-                                TOOL_META_EXTERNAL_DISPATCH_KEY: true,
-                                "goose.acp.kind": kind,
-                            }));
-                            let message = Message::assistant().with_tool_request_with_metadata(
-                                id,
-                                Ok(params),
-                                None,
-                                tool_meta,
-                            );
-                            yield (Some(message), None);
+                            yield (Some(tool_request_message(id, name, kind, raw_input)), None);
                         }
                     }
                     AcpUpdate::ToolCallComplete {
@@ -974,8 +1094,7 @@ impl Provider for AcpProvider {
                         content,
                         is_error,
                     } => {
-                        text_run = None;
-                        thought_run = None;
+                        runs.end();
                         if rejected_tool_calls.remove(&id) {
                             // In chat mode no tool_request was emitted (suppressed at
                             // ToolCallStart), so surface a plain text message. In other
@@ -994,20 +1113,13 @@ impl Provider for AcpProvider {
                                 yield (Some(message), None);
                             }
                         } else {
-                            let result_content =
-                                acp_tool_call_content_to_rmcp(content, raw_output);
-                            let result = if is_error {
-                                CallToolResult::error(result_content)
-                            } else {
-                                CallToolResult::success(result_content)
-                            };
-                            let message = Message::user().with_tool_response(id, Ok(result));
+                            let message =
+                                tool_response_message(id, raw_output, content, is_error);
                             yield (Some(message), None);
                         }
                     }
                     AcpUpdate::PermissionRequest { request, response_tx } => {
-                        text_run = None;
-                        thought_run = None;
+                        runs.end();
                         if let Some(decision) = permission_decision_from_mode(goose_mode) {
                             if decision.should_record_rejection() {
                                 rejected_tool_calls.insert(request.tool_call.tool_call_id.0.to_string());
@@ -1125,6 +1237,7 @@ struct AcpClientLoop {
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     context_size: Arc<AtomicU64>,
     effort: AcpEffortState,
+    unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
 }
 
 impl AcpClientLoop {
@@ -1134,6 +1247,7 @@ impl AcpClientLoop {
         pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
         context_size: Arc<AtomicU64>,
         effort: AcpEffortState,
+        unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
     ) -> Self {
         Self {
             config,
@@ -1142,6 +1256,7 @@ impl AcpClientLoop {
             pending_tool_updates,
             context_size,
             effort,
+            unsolicited_tx,
         }
     }
 
@@ -1197,6 +1312,7 @@ impl AcpClientLoop {
             pending_tool_updates,
             context_size,
             effort,
+            unsolicited_tx,
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
@@ -1212,6 +1328,7 @@ impl AcpClientLoop {
                     let pending_tool_updates = pending_tool_updates.clone();
                     let context_size = context_size.clone();
                     let session_state = session_state.clone();
+                    let unsolicited_tx = unsolicited_tx.clone();
                     async move |notification: SessionNotification, _cx| {
                         let is_active_session =
                             session_state.active_id.lock().is_ok_and(|active| {
@@ -1260,24 +1377,30 @@ impl AcpClientLoop {
                             }
                             _ => {}
                         }
-                        if let Some(tx) = prompt_response_tx
-                            .lock()
-                            .ok()
-                            .as_ref()
-                            .and_then(|g| g.as_ref())
+                        // With no goose prompt in flight the agent is running a turn of its
+                        // own (a router waking the session); surface it rather than drop it.
+                        let prompt_tx = prompt_response_tx.lock().ok().and_then(|g| g.clone());
+                        let deliver = |update: AcpUpdate| match &prompt_tx {
+                            Some(tx) => {
+                                let _ = tx.try_send(update);
+                            }
+                            None => {
+                                let _ = unsolicited_tx.send(Unsolicited::Update(Box::new(update)));
+                            }
+                        };
                         {
                             match notification.update {
                                 SessionUpdate::AgentMessageChunk(ContentChunk {
                                     content: ContentBlock::Text(text),
                                     ..
                                 }) => {
-                                    let _ = tx.try_send(AcpUpdate::Text(text));
+                                    deliver(AcpUpdate::Text(text));
                                 }
                                 SessionUpdate::AgentThoughtChunk(ContentChunk {
                                     content: ContentBlock::Text(TextContent { text, .. }),
                                     ..
                                 }) => {
-                                    let _ = tx.try_send(AcpUpdate::Thought(text));
+                                    deliver(AcpUpdate::Thought(text));
                                 }
                                 SessionUpdate::ToolCall(tool_call) => {
                                     let id = tool_call.tool_call_id.0.to_string();
@@ -1309,7 +1432,7 @@ impl AcpClientLoop {
                                     // tool_meta for stable categorization, and the
                                     // goose.external_dispatch marker keeps `name` off the
                                     // agent loop's routing/auth paths.
-                                    let _ = tx.try_send(AcpUpdate::ToolCallStart {
+                                    deliver(AcpUpdate::ToolCallStart {
                                         id: id.clone(),
                                         name: tool_call.title.clone(),
                                         kind: tool_call.kind,
@@ -1321,7 +1444,7 @@ impl AcpClientLoop {
                                         } else {
                                             Some(accumulated.content)
                                         };
-                                        let _ = tx.try_send(AcpUpdate::ToolCallComplete {
+                                        deliver(AcpUpdate::ToolCallComplete {
                                             id,
                                             raw_output: accumulated.raw_output,
                                             content,
@@ -1367,7 +1490,7 @@ impl AcpClientLoop {
                                         } else {
                                             Some(accumulated.content)
                                         };
-                                        let _ = tx.try_send(AcpUpdate::ToolCallComplete {
+                                        deliver(AcpUpdate::ToolCallComplete {
                                             id,
                                             raw_output: accumulated.raw_output,
                                             content,
@@ -2532,6 +2655,8 @@ mod tests {
                 model_config_option_id: None,
                 applied_model: Arc::new(Mutex::new(None)),
                 effort: AcpEffortState::new(),
+                unsolicited: broadcast::channel(1).0,
+                unsolicited_tx: mpsc::unbounded_channel().0,
                 tx,
                 cancel_tx: None,
                 loop_thread: None,
@@ -4725,5 +4850,151 @@ mod tests {
                 "goose.acp.kind serialized wrong for kind={kind:?}"
             );
         }
+    }
+
+    fn agent_text(session: &str, text: &str) -> SessionNotification {
+        SessionNotification::new(
+            SessionId::new(session),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(text),
+            ))),
+        )
+    }
+
+    async fn next_unsolicited(
+        updates: &mut broadcast::Receiver<UnsolicitedUpdate>,
+    ) -> UnsolicitedUpdate {
+        tokio::time::timeout(std::time::Duration::from_secs(5), updates.recv())
+            .await
+            .expect("an unsolicited update")
+            .expect("the relay stays open")
+    }
+
+    /// A router runs turns on the parent session after goose's own turn ends. Those updates
+    /// must reach goose shaped like a prompt's stream, while a prompt still gets its own.
+    #[tokio::test]
+    async fn updates_without_a_prompt_in_flight_reach_unsolicited_subscribers() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+            PromptRequest, PromptResponse, ToolCall, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        use agent_client_protocol::{on_receive_request, Agent as ScriptedAgent, ByteStreams};
+        use futures::StreamExt;
+
+        const SESSION: &str = "rtr-parent";
+        let (client_read, agent_write) = tokio::io::duplex(64 * 1024);
+        let (agent_read, client_write) = tokio::io::duplex(64 * 1024);
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let agent_wake = wake.clone();
+
+        tokio::spawn(async move {
+            ScriptedAgent
+                .builder()
+                .on_receive_request(
+                    async |_req: InitializeRequest, responder, _cx| {
+                        responder.respond(
+                            InitializeResponse::new(ProtocolVersion::LATEST)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_req: NewSessionRequest, responder, cx| {
+                        responder.respond(NewSessionResponse::new(SessionId::new(SESSION)))?;
+                        let wake = agent_wake.clone();
+                        tokio::spawn(async move {
+                            wake.notified().await;
+                            let tool = ToolCall::new("call-1", "Run checks")
+                                .status(ToolCallStatus::InProgress);
+                            let done = ToolCallUpdate::new(
+                                "call-1",
+                                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+                            );
+                            for notification in [
+                                agent_text(SESSION, "Worker handed "),
+                                agent_text(SESSION, "off."),
+                                SessionNotification::new(
+                                    SessionId::new(SESSION),
+                                    SessionUpdate::ToolCall(tool),
+                                ),
+                                SessionNotification::new(
+                                    SessionId::new(SESSION),
+                                    SessionUpdate::ToolCallUpdate(done),
+                                ),
+                                agent_text(SESSION, "Admitted."),
+                            ] {
+                                cx.send_notification(notification).unwrap();
+                            }
+                        });
+                        Ok(())
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async |_req: PromptRequest, responder, cx| {
+                        cx.send_notification(agent_text(SESSION, "in turn"))?;
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    },
+                    on_receive_request!(),
+                )
+                .connect_to(ByteStreams::new(
+                    agent_write.compat_write(),
+                    agent_read.compat(),
+                ))
+                .await
+        });
+
+        let provider = AcpProvider::connect_with_transport(
+            "router-acp".to_string(),
+            GooseMode::Auto,
+            test_acp_config(HashMap::new(), None),
+            ByteStreams::new(client_write.compat_write(), client_read.compat()),
+        )
+        .await
+        .unwrap();
+        let mut updates = provider.subscribe_unsolicited().unwrap();
+        wake.notify_one();
+
+        let mut messages = Vec::new();
+        while let UnsolicitedUpdate::Message(message) = next_unsolicited(&mut updates).await {
+            messages.push(message);
+        }
+        let mut conversation = crate::conversation::Conversation::empty();
+        for message in messages {
+            conversation.push(message);
+        }
+        let recorded = conversation.messages();
+        assert_eq!(recorded.len(), 4, "{recorded:#?}");
+        assert_eq!(recorded[0].role, Role::Assistant);
+        assert_eq!(recorded[0].as_concat_text(), "Worker handed off.");
+        assert!(matches!(
+            &recorded[1].content[..],
+            [MessageContent::ToolRequest(request)]
+                if request.tool_call.as_ref().is_ok_and(|call| call.name == "Run checks")
+        ));
+        assert!(matches!(
+            &recorded[2].content[..],
+            [MessageContent::ToolResponse(response)] if response.id == "call-1"
+        ));
+        assert_eq!(recorded[3].as_concat_text(), "Admitted.");
+        assert_ne!(recorded[0].id, recorded[3].id);
+
+        let model = ModelConfig::new("test-model");
+        let mut stream = provider
+            .stream(&model, "", &[Message::user().with_text("next")], &[])
+            .await
+            .unwrap();
+        let mut in_turn = String::new();
+        while let Some(item) = stream.next().await {
+            if let (Some(message), _) = item.unwrap() {
+                in_turn.push_str(&message.as_concat_text());
+            }
+        }
+        assert_eq!(in_turn, "in turn");
+        assert!(matches!(
+            updates.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

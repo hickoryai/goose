@@ -74,6 +74,10 @@ When goose delegates work to a subagent, you can see the subagent's tool calls i
     - **`Tab`** or **`q`** - Close the navigator
 
     You can also click a row to open it in terminals that support mouse reporting. Between turns, run `/children` to browse completed, failed, or stopped child sessions. The navigator is only available in an interactive terminal and is never shown with `--output-format json` or `stream-json`, in headless runs, or when output is redirected.
+
+    When the session runs on the `router-acp` provider, the navigator also lists the delegates router-acp runs for it, read through `router-acp state-query v1 delegates` with the same `ROUTER_ACP_CONFIG`. Their transcript is router-acp's log: the task, streamed text, tool calls with their latest status, and the final response. goose offers `Tab` as soon as router-acp reports a delegate at work, and `/children` always works. If router-acp cannot be queried, the navigator shows why on an inline line instead.
+
+    Output the router produces after your turn ends, such as a planner reviewing a worker's hand-off, is printed above the prompt under `◆ background turn` without disturbing what you are typing, and is recorded in the session history.
   </TabItem>
 </Tabs>
 

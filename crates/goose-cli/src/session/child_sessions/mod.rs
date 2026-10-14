@@ -2,6 +2,7 @@
 //! Opened with Tab while a turn runs, or with `/children` between turns.
 
 mod keys;
+pub mod router;
 #[cfg(unix)]
 mod terminal;
 #[cfg(not(unix))]
@@ -12,6 +13,7 @@ mod view;
 use console::style;
 use goose::agents::state_machine::{subagent_states, SubagentState};
 use goose::conversation::message::{Message, MessageContent};
+use goose::providers::router_acp::{RouterStateSource, DELEGATE_ID_SEPARATOR};
 use goose::session::SessionManager;
 use goose::utils::safe_truncate;
 pub use keys::Key;
@@ -38,6 +40,7 @@ pub struct ChildSessionNavigator {
     hinted: bool,
     listener: Option<terminal::KeyListener>,
     open: Option<OpenView>,
+    router: Option<router::RouterChildren>,
 }
 
 impl ChildSessionNavigator {
@@ -52,6 +55,38 @@ impl ChildSessionNavigator {
             hinted: false,
             listener: None,
             open: None,
+            router: None,
+        }
+    }
+
+    /// Also lists the delegates of router session `router_session_id`, which live in
+    /// router-acp's state rather than goose's.
+    pub fn with_router(
+        mut self,
+        source: anyhow::Result<RouterStateSource>,
+        router_session_id: String,
+    ) -> Self {
+        if self.available {
+            self.router = Some(router::RouterChildren::start(source, router_session_id));
+        }
+        self
+    }
+
+    pub fn watches_router(&self) -> bool {
+        self.router.is_some()
+    }
+
+    /// Offers the navigator once router-acp reports a delegate at work, since router
+    /// delegates never show up in goose's own subagent state.
+    pub fn check_router(&mut self) {
+        if !self.has_children
+            && self
+                .router
+                .as_ref()
+                .is_some_and(|router| router.any_running(chrono::Utc::now()))
+        {
+            self.has_children = true;
+            self.listen();
         }
     }
 
@@ -115,9 +150,19 @@ impl ChildSessionNavigator {
         let Some(view) = self.open.as_mut() else {
             return;
         };
+        if let Some(router) = &self.router {
+            let router_path: Vec<&str> = view
+                .navigator
+                .path_ids()
+                .into_iter()
+                .filter(|id| is_router_delegate(id))
+                .collect();
+            router.follow(&router_path);
+        }
         if let Ok(snapshot) = load_snapshot(
             &self.session_manager,
             &self.root_id,
+            self.router.as_ref(),
             view.navigator.current(),
             turn_active,
         )
@@ -179,7 +224,58 @@ fn delegates_child(message: &Message) -> bool {
     })
 }
 
+fn is_router_delegate(id: &str) -> bool {
+    id.contains(DELEGATE_ID_SEPARATOR)
+}
+
 async fn load_snapshot(
+    session_manager: &SessionManager,
+    root_id: &str,
+    router: Option<&router::RouterChildren>,
+    current: Option<&str>,
+    turn_active: bool,
+) -> anyhow::Result<Snapshot> {
+    let mut snapshot = match current {
+        Some(id) if is_router_delegate(id) => Snapshot {
+            transcript: Some(Vec::new()),
+            ..Default::default()
+        },
+        _ => load_goose_snapshot(session_manager, root_id, current, turn_active).await?,
+    };
+    let Some(router) = router else {
+        return Ok(snapshot);
+    };
+    let delegates = match router.latest() {
+        router::Fetched::Ready(delegates) => delegates,
+        router::Fetched::Pending => {
+            snapshot.notice = Some("Loading router-acp delegates…".to_string());
+            return Ok(snapshot);
+        }
+        router::Fetched::Failed(error) => {
+            snapshot.notice = Some(format!("router-acp delegates unavailable: {error}"));
+            return Ok(snapshot);
+        }
+    };
+    let now = chrono::Utc::now();
+    match current {
+        None => snapshot
+            .children
+            .extend(router::rows_for(&delegates, router.root(), now)),
+        Some(id) if is_router_delegate(id) => {
+            snapshot.children = router::rows_for(&delegates, id, now);
+            match delegates.iter().find(|delegate| delegate.id == id) {
+                Some(delegate) => {
+                    snapshot.transcript = Some(router::transcript_lines(&delegate.log))
+                }
+                None => snapshot.notice = Some("router-acp no longer lists this delegate".into()),
+            }
+        }
+        Some(_) => {}
+    }
+    Ok(snapshot)
+}
+
+async fn load_goose_snapshot(
     session_manager: &SessionManager,
     root_id: &str,
     current: Option<&str>,
@@ -206,6 +302,7 @@ async fn load_snapshot(
     Ok(Snapshot {
         children,
         transcript: current.map(|_| transcript_lines(&messages)),
+        notice: None,
     })
 }
 

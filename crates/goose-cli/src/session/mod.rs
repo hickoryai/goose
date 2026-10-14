@@ -9,6 +9,7 @@ mod paste;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
+mod unsolicited;
 
 use crate::session::task_execution_display::{
     format_task_execution_notification, TASK_EXECUTION_NOTIFICATION_TYPE,
@@ -45,12 +46,14 @@ use rmcp::model::{ElicitationAction, PromptMessage};
 use rmcp::model::{ErrorCode, ErrorData};
 use strum::VariantNames;
 
+use goose::agents::provider_manager::provider_name_for;
 use goose::config::paths::Paths;
 use goose::config::providers;
 use goose::conversation::message::{
     ActionRequiredData, Message, MessageContent, ToolConfirmationRequest,
 };
 use goose::providers::inventory::ProviderInventoryService;
+use goose::providers::router_acp::{is_router_acp, RouterStateSource};
 use goose::session::SessionManager;
 use rustyline::EditMode;
 use serde::{Deserialize, Serialize};
@@ -248,6 +251,11 @@ pub struct CliSession {
     /// gate.
     extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
     loading_announced: bool,
+    /// Records (and at the prompt, shows) what the agent says while no turn of ours runs.
+    unsolicited: Option<unsolicited::UnsolicitedRelay>,
+    /// Prints router-acp planner workers' status at the prompt: the router session it
+    /// watches and the watcher.
+    router_status: Option<(String, AbortOnDropHandle<()>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +340,8 @@ impl CliSession {
             stats,
             extension_loading,
             loading_announced: false,
+            unsolicited: None,
+            router_status: None,
         }
     }
 
@@ -548,6 +558,8 @@ impl CliSession {
     ) -> Result<()> {
         self.ensure_extensions_loaded(interactive).await?;
         let cancel_token = cancel_token.clone();
+        self.sync_unsolicited(None).await;
+        self.settle_unsolicited().await;
         self.push_message(message);
         self.process_agent_response(interactive, cancel_token)
             .await?;
@@ -610,6 +622,7 @@ impl CliSession {
             }
 
             self.display_context_usage().await?;
+            self.sync_unsolicited(Some(&mut editor)).await;
 
             let conversation_strings: Vec<String> = self
                 .messages
@@ -625,7 +638,11 @@ impl CliSession {
                 .collect();
 
             output::run_status_hook("waiting");
-            let input = input::get_input(&mut editor, Some(&conversation_strings))?;
+            let input = input::get_input(
+                &mut editor,
+                Some(&conversation_strings),
+                self.unsolicited.as_ref(),
+            )?;
             if matches!(input, InputResult::Exit) {
                 break;
             }
@@ -730,13 +747,7 @@ impl CliSession {
             }
             InputResult::Children => {
                 history.save(editor);
-                child_sessions::ChildSessionNavigator::new(
-                    self.agent.config.session_manager.clone(),
-                    self.session_id.clone(),
-                    true,
-                )
-                .browse()
-                .await;
+                self.child_navigator(true).await.browse().await;
             }
             InputResult::Edit(prefill) => {
                 history.save(editor);
@@ -788,9 +799,10 @@ impl CliSession {
         editor: &mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     ) -> Result<()> {
         history.save(editor);
-        self.push_message(Message::user().with_text(content));
-
         let _provider = self.agent.provider(&self.session_id).await?;
+        self.sync_unsolicited(Some(editor)).await;
+        self.settle_unsolicited().await;
+        self.push_message(Message::user().with_text(content));
 
         println!();
         output::run_status_hook("thinking");
@@ -1350,11 +1362,9 @@ impl CliSession {
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
         let mut stream_error = None;
-        let mut children = child_sessions::ChildSessionNavigator::new(
-            self.agent.config.session_manager.clone(),
-            self.session_id.clone(),
-            interactive && !is_json_mode && !is_stream_json_mode,
-        );
+        let mut children = self
+            .child_navigator(interactive && !is_json_mode && !is_stream_json_mode)
+            .await;
         let mut deferred_messages: Vec<Message> = Vec::new();
         let mut refresh_children = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
 
@@ -1372,8 +1382,12 @@ impl CliSession {
                         render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                     }
                 }
-                _ = refresh_children.tick(), if children.is_open() => {
-                    children.refresh(true).await;
+                _ = refresh_children.tick(), if children.is_open() || children.watches_router() => {
+                    if children.is_open() {
+                        children.refresh(true).await;
+                    } else {
+                        children.check_router();
+                    }
                 }
                 result = stream.next() => {
                     match result {
@@ -2059,6 +2073,149 @@ impl CliSession {
 
     fn push_message(&mut self, message: Message) {
         self.messages.push(message);
+    }
+
+    /// Keeps the background-output relay on the provider now serving this session, printing
+    /// through `editor` when there is one, and folds what it recorded into `self.messages`.
+    async fn sync_unsolicited(
+        &mut self,
+        editor: Option<&mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>>,
+    ) {
+        let session_manager = self.agent.config.session_manager.clone();
+        let provider = match session_manager.get_session(&self.session_id, false).await {
+            Ok(session) => self.agent.config.providers.pinned(&session).await,
+            Err(_) => None,
+        };
+        let display = editor.filter(|_| self.output_format == "text");
+        let current = self.unsolicited.as_ref().is_some_and(|relay| {
+            provider
+                .as_ref()
+                .is_some_and(|provider| relay.follows(provider, &self.session_id))
+                && (display.is_none() || relay.displays())
+        });
+        let replaced = !current && provider.is_some();
+        if let (false, Some(provider)) = (current, provider) {
+            if let Some(previous) = self.unsolicited.take() {
+                previous.settle().await;
+                if previous.session_id() == self.session_id {
+                    for message in previous.take_recorded() {
+                        self.messages.push(message);
+                    }
+                }
+            }
+            let printer = display
+                .and_then(|editor| editor.create_external_printer().ok())
+                .map(|printer| Box::new(printer) as unsolicited::Printer);
+            self.unsolicited = unsolicited::UnsolicitedRelay::start(
+                provider,
+                session_manager,
+                self.session_id.clone(),
+                printer,
+                self.debug,
+            );
+        }
+        self.take_unsolicited();
+        self.sync_router_status(replaced).await;
+    }
+
+    /// Keeps the prompt-time worker status following the router session this goose session
+    /// runs in, printed through the background-output relay.
+    async fn sync_router_status(&mut self, relay_replaced: bool) {
+        let notifier = self
+            .unsolicited
+            .as_ref()
+            .filter(|relay| relay.displays())
+            .map(|relay| relay.notifier());
+        let root = match notifier {
+            Some(_) => self.router_session_id().await,
+            None => None,
+        };
+        let (Some(notifier), Some(root)) = (notifier, root) else {
+            self.router_status = None;
+            return;
+        };
+        if !relay_replaced
+            && self
+                .router_status
+                .as_ref()
+                .is_some_and(|(id, _)| *id == root)
+        {
+            return;
+        }
+        self.router_status = RouterStateSource::configured().ok().map(|source| {
+            let watch = child_sessions::router::watch_status(source, root.clone(), move |line| {
+                notifier.notice(console::style(line).dim().to_string())
+            });
+            (root, watch)
+        });
+    }
+
+    /// The navigator over this session's children, including the delegates router-acp runs
+    /// for it when router-acp serves the session.
+    async fn child_navigator(&self, enabled: bool) -> child_sessions::ChildSessionNavigator {
+        let navigator = child_sessions::ChildSessionNavigator::new(
+            self.agent.config.session_manager.clone(),
+            self.session_id.clone(),
+            enabled,
+        );
+        match self.router_session_id().await {
+            Some(router_session_id) => {
+                navigator.with_router(RouterStateSource::configured(), router_session_id)
+            }
+            None => navigator,
+        }
+    }
+
+    /// The router-acp session backing this goose session: the one its latest turn ran in
+    /// (what the provider resumes), else the one the live provider opened.
+    async fn router_session_id(&self) -> Option<String> {
+        let session = self
+            .agent
+            .config
+            .session_manager
+            .get_session(&self.session_id, false)
+            .await
+            .ok()?;
+        let provider_name = provider_name_for(&session).ok()?;
+        if !is_router_acp(&provider_name) {
+            return None;
+        }
+        let recorded = self
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| message.metadata.inference.as_ref())
+            .filter(|inference| inference.provider == provider_name)
+            .and_then(|inference| inference.provider_session_id.clone());
+        match recorded {
+            Some(id) => Some(id),
+            None => self
+                .agent
+                .config
+                .providers
+                .pinned(&session)
+                .await?
+                .provider_session_id(),
+        }
+    }
+
+    /// Records background output streamed so far, so it stays ahead of the next user turn.
+    async fn settle_unsolicited(&mut self) {
+        if let Some(relay) = &self.unsolicited {
+            relay.settle().await;
+        }
+        self.take_unsolicited();
+    }
+
+    fn take_unsolicited(&mut self) {
+        let recorded = self
+            .unsolicited
+            .as_ref()
+            .map(unsolicited::UnsolicitedRelay::take_recorded)
+            .unwrap_or_default();
+        for message in recorded {
+            self.messages.push(message);
+        }
     }
 }
 

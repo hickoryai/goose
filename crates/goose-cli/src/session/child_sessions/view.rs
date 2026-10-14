@@ -1,5 +1,6 @@
 use super::keys::Key;
 use console::{measure_text_width, style, truncate_str};
+use goose::providers::router_acp::DELEGATE_ID_SEPARATOR;
 use unicode_segmentation::UnicodeSegmentation;
 
 const SHORT_ID_CHARS: usize = 8;
@@ -53,6 +54,8 @@ pub struct TranscriptLine {
 pub struct Snapshot {
     pub children: Vec<ChildRow>,
     pub transcript: Option<Vec<TranscriptLine>>,
+    /// Why some children may be missing, e.g. router-acp could not be queried.
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +88,10 @@ pub struct Navigator {
 impl Navigator {
     pub fn current(&self) -> Option<&str> {
         self.path.last().map(|crumb| crumb.id.as_str())
+    }
+
+    pub fn path_ids(&self) -> Vec<&str> {
+        self.path.iter().map(|crumb| crumb.id.as_str()).collect()
     }
 
     pub fn handle(&mut self, key: Key, snapshot: &Snapshot, frame: &Frame) -> Outcome {
@@ -168,6 +175,9 @@ impl Navigator {
             self.list_offset = self.selected + 1 - list_rows;
         }
 
+        if let Some(notice) = &snapshot.notice {
+            frame.lines.push(fit(notice, width, |s| style(s).yellow()));
+        }
         if snapshot.children.is_empty() && snapshot.transcript.is_none() {
             frame
                 .lines
@@ -234,7 +244,12 @@ impl Navigator {
 
 fn child_row(child: &ChildRow, selected: bool, width: usize) -> String {
     let marker = if selected { "›" } else { " " };
-    let short_id: String = child.id.chars().take(SHORT_ID_CHARS).collect();
+    // Router delegate ids all start with their parent's id; the tail tells them apart.
+    let distinct = child
+        .id
+        .rsplit_once(DELEGATE_ID_SEPARATOR)
+        .map_or(child.id.as_str(), |(_, tail)| tail);
+    let short_id: String = distinct.chars().take(SHORT_ID_CHARS).collect();
     let row = format!(
         "{marker} {:<9} {}  {short_id}  {}",
         child.status.label(),
@@ -330,6 +345,7 @@ mod tests {
                 row("bbbbbbbbbb", ChildStatus::Failed),
             ],
             transcript: None,
+            notice: None,
         };
         let mut navigator = Navigator::default();
 
@@ -355,6 +371,21 @@ mod tests {
     }
 
     #[test]
+    fn notice_and_router_ids_render_inline() {
+        let snapshot = Snapshot {
+            children: vec![row(
+                "rtr-parent::delegate-3485c19f-e580",
+                ChildStatus::Running,
+            )],
+            transcript: None,
+            notice: Some("router-acp delegates unavailable: timed out".to_string()),
+        };
+        let lines = plain(&Navigator::default().render(&snapshot, 80, 8));
+        assert_eq!(lines[2], "router-acp delegates unavailable: timed out");
+        assert!(lines[3].contains("  3485c19f  "));
+    }
+
+    #[test]
     fn lines_never_exceed_the_width() {
         let snapshot = Snapshot {
             children: vec![row(&"x".repeat(60), ChildStatus::Completed)],
@@ -362,6 +393,7 @@ mod tests {
                 kind: LineKind::Body,
                 text: "word ".repeat(40),
             }]),
+            notice: None,
         };
         let frame = Navigator::default().render(&snapshot, 30, 12);
         assert!(plain(&frame)
@@ -377,6 +409,7 @@ mod tests {
                 kind: LineKind::Body,
                 text: "safe\x1b[2Jtext".to_string(),
             }]),
+            notice: None,
         };
         let frame = Navigator::default().render(&snapshot, 40, 6);
         assert!(frame.lines.iter().all(|line| !line.contains("\x1b[2J")));
@@ -387,6 +420,7 @@ mod tests {
         let snapshot = Snapshot {
             children: vec![],
             transcript: transcript(20),
+            notice: None,
         };
         let mut navigator = Navigator::default();
         let frame = navigator.render(&snapshot, 40, 8);
@@ -420,6 +454,7 @@ mod tests {
                 row("second", ChildStatus::Running),
             ],
             transcript: None,
+            notice: None,
         };
         let mut navigator = Navigator::default();
         let frame = navigator.render(&root, 60, 10);
@@ -432,6 +467,7 @@ mod tests {
         let child = Snapshot {
             children: vec![row("grandchild", ChildStatus::Completed)],
             transcript: transcript(3),
+            notice: None,
         };
         let lines = plain(&navigator.render(&child, 60, 10));
         assert_eq!(lines[0], "Child sessions › task second");
@@ -454,6 +490,7 @@ mod tests {
                 row("second", ChildStatus::Stopped),
             ],
             transcript: None,
+            notice: None,
         };
         let mut navigator = Navigator::default();
         let frame = navigator.render(&root, 60, 10);
@@ -471,6 +508,7 @@ mod tests {
                 .map(|n| row(&format!("child{n}"), ChildStatus::Running))
                 .collect(),
             transcript: None,
+            notice: None,
         };
         let mut navigator = Navigator::default();
         let mut frame = navigator.render(&root, 60, 6);

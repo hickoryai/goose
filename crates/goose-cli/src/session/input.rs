@@ -2,6 +2,7 @@ use super::completion::GooseCompleter;
 use super::paste::{
     read_paste_aware_input, PasteAwareEnterHandler, PasteCaptureHandler, PasteState,
 };
+use super::unsolicited::UnsolicitedRelay;
 use super::{CompletionCache, HintStatus};
 use anyhow::Result;
 use goose::config::{Config, GooseMode};
@@ -117,6 +118,7 @@ fn should_use_editor_always(
 pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     conversation_messages: Option<&Vec<String>>,
+    background_output: Option<&UnsolicitedRelay>,
 ) -> Result<InputResult> {
     let config = Config::global();
     let prompt_editor = config.get_goose_prompt_editor().ok().flatten();
@@ -181,7 +183,15 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
-    let input = match read_paste_aware_input(editor, paste_state) {
+    // Background agent output prints above the line being edited only while it is edited.
+    if let Some(relay) = background_output {
+        relay.resume();
+    }
+    let read = read_paste_aware_input(editor, paste_state);
+    if let Some(relay) = background_output {
+        relay.pause();
+    }
+    let input = match read {
         Ok(text) => text,
         Err(e) => match e {
             rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),

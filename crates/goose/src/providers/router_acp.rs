@@ -1,7 +1,11 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
 
 use crate::acp::{
     configured_model_for_provider, extension_configs_to_mcp_servers, AcpProvider,
@@ -55,6 +59,135 @@ fn router_config_path(config: &Config) -> Result<PathBuf> {
     Ok(home.join(".config").join("router-acp").join("router.yaml"))
 }
 
+pub fn is_router_acp(provider_name: &str) -> bool {
+    provider_name == ROUTER_ACP_PROVIDER_NAME
+}
+
+/// Where router-acp keeps the state a router session's delegates live in: the binary the
+/// provider spawns and the config it spawns it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterStateSource {
+    pub binary: PathBuf,
+    pub config: PathBuf,
+}
+
+impl RouterStateSource {
+    pub fn configured() -> Result<Self> {
+        Ok(Self {
+            binary: SearchPaths::builder()
+                .with_npm()
+                .resolve(ROUTER_ACP_BINARY)?,
+            config: router_config_path(Config::global())?,
+        })
+    }
+
+    /// Delegate panels of every given router session, from router-acp's read-only
+    /// `state-query v1 delegates` boundary.
+    pub async fn delegates(
+        &self,
+        parent_session_ids: &[String],
+        timeout: Duration,
+    ) -> Result<Vec<RouterDelegate>> {
+        let mut command = tokio::process::Command::new(&self.binary);
+        command
+            .arg("state-query")
+            .arg("--config")
+            .arg(&self.config)
+            .args(["v1", "delegates"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for id in parent_session_ids {
+            command.arg("--session").arg(id);
+        }
+        crate::subprocess::configure_subprocess(&mut command);
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("router-acp state-query timed out"))??;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let reason = stderr.trim().lines().last().unwrap_or("no error output");
+            anyhow::bail!("router-acp state-query failed: {reason}");
+        }
+        parse_delegates(&output.stdout)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouterDelegate {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub has_response: bool,
+    /// The planner work this delegate runs, when router-acp's planner started it.
+    #[serde(default)]
+    pub work_id: Option<String>,
+    /// A planner worker's lifecycle from router-acp's durable work record: `running`
+    /// while its attempt is open, else the work's status (`review-pending`, `finished`,
+    /// `interrupted`, ...), or `ended` for a session a later one replaced.
+    #[serde(default)]
+    pub state: Option<String>,
+    pub routing: Option<serde_json::Value>,
+    #[serde(default)]
+    pub log: Vec<RouterDelegateLog>,
+}
+
+impl RouterDelegate {
+    /// The router session that delegated this one.
+    pub fn parent_id(&self) -> Option<&str> {
+        self.routing
+            .as_ref()
+            .and_then(|routing| routing.get("parent"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| self.id.rsplit_once(DELEGATE_ID_SEPARATOR).map(|(p, _)| p))
+    }
+}
+
+/// router-acp names a delegate session `<parent router id>::delegate-<downstream id>`.
+pub const DELEGATE_ID_SEPARATOR: &str = "::delegate-";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouterDelegateLog {
+    pub ts: Option<DateTime<Utc>>,
+    pub kind: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub summary: String,
+    pub detail: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct StateQueryEnvelope {
+    version: u32,
+    command: String,
+    data: DelegatesData,
+}
+
+#[derive(Deserialize)]
+struct DelegatesData {
+    children: Vec<RouterDelegate>,
+}
+
+pub fn parse_delegates(json: &[u8]) -> Result<Vec<RouterDelegate>> {
+    let envelope: StateQueryEnvelope = serde_json::from_slice(json)?;
+    if envelope.version != 1 || envelope.command != "delegates" {
+        anyhow::bail!(
+            "unexpected router-acp state-query reply: version {} {}",
+            envelope.version,
+            envelope.command
+        );
+    }
+    Ok(envelope.data.children)
+}
+
 impl RouterAcpProvider {
     fn create(
         extensions: Vec<crate::config::ExtensionConfig>,
@@ -63,10 +196,10 @@ impl RouterAcpProvider {
     ) -> BoxFuture<'static, Result<AcpProvider>> {
         Box::pin(async move {
             let config = Config::global();
-            let resolved_command = SearchPaths::builder()
-                .with_npm()
-                .resolve(ROUTER_ACP_BINARY)?;
-            let router_config = router_config_path(config)?;
+            let RouterStateSource {
+                binary: resolved_command,
+                config: router_config,
+            } = RouterStateSource::configured()?;
             let goose_mode = config.resolve_goose_mode()?;
             let model = if use_default_model {
                 ACP_CURRENT_MODEL.to_string()
@@ -135,6 +268,22 @@ impl ProviderDef for RouterAcpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegates_reply_is_read_only_from_a_v1_delegates_envelope() {
+        let reply = br#"{"version":1,"command":"delegates","data":{"children":[{
+            "id":"rtr-1::delegate-d1","title":"t","agent":null,"model":"opus",
+            "createdAt":"2026-10-13T20:32:10Z","updatedAt":"2026-10-13T20:40:19Z",
+            "tokensTotal":1,"contextUsed":2,"routing":null,"hasResponse":false,
+            "log":[{"ts":"2026-10-13T20:32:10Z","kind":"delegate_task","role":"user",
+                    "summary":"task","detail":{"work_id":"w"}}]}]}}"#;
+        let delegates = parse_delegates(reply).unwrap();
+        assert_eq!(delegates[0].parent_id(), Some("rtr-1"));
+        assert_eq!(delegates[0].log[0].kind, "delegate_task");
+
+        let other = br#"{"version":2,"command":"delegates","data":{"children":[]}}"#;
+        assert!(parse_delegates(other).is_err());
+    }
 
     #[test]
     fn router_config_defaults_to_the_router_acp_home_and_honors_overrides() {
