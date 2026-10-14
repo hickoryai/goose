@@ -292,7 +292,7 @@ pub fn show_extension_failures(failures: &[ExtensionFailure]) {
         eprintln!(
             "{}",
             style(format!(
-                "    Hint: ask goose to help debug the '{}' extension",
+                "    Hint: ask kory to help debug the '{}' extension",
                 failure.label
             ))
             .dim()
@@ -1543,11 +1543,11 @@ pub fn display_session_info(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // ASCII art goose with session info on the right
+    // ASCII art leaf with session info on the right
     outln!();
     outln!(
         "  {}  {} {} {} {} {}",
-        style("  __( O)>").white(),
+        style("   ,--.  ").green(),
         style("●").green(),
         style(status).dim(),
         style("·").dim(),
@@ -1558,7 +1558,7 @@ pub fn display_session_info(
     if let Some(id) = session_id {
         outln!(
             "  {}  {} {} {}",
-            style(r" \____)").white(),
+            style("  ( /  ) ").green(),
             style(" ").dim(),
             style(id).dim(),
             style(format!("· {}", cwd_display)).dim(),
@@ -1566,15 +1566,15 @@ pub fn display_session_info(
     } else {
         outln!(
             "  {}  {} {}",
-            style(r" \____)").white(),
+            style("  ( /  ) ").green(),
             style(" ").dim(),
             style(format!("  {}", cwd_display)).dim(),
         );
     }
     outln!(
         "  {}  {}",
-        style("   L L").white(),
-        style("   goose is ready").white()
+        style("   `/--' ").green(),
+        style("   🍃 kory is ready").white()
     );
 }
 
@@ -1589,7 +1589,7 @@ fn set_terminal_title() {
     // Sanitize: strip control characters (ESC, BEL, etc.) to prevent terminal escape injection
     let sanitized: String = dir_name.chars().filter(|c| !c.is_control()).collect();
     // OSC 0 sets the terminal window/tab title
-    out!("\x1b]0;🪿 {}\x07", sanitized);
+    out!("\x1b]0;🍃 {}\x07", sanitized);
     let _ = std::io::stdout().flush();
 }
 
