@@ -592,7 +592,7 @@ fn header(state: &State, cols: usize) -> String {
         }
     }
     let summary = if counts.is_empty() {
-        "none yet".to_string()
+        "none running · /children for all".to_string()
     } else {
         counts
             .iter()
@@ -614,7 +614,7 @@ fn header(state: &State, cols: usize) -> String {
         .to_string()
 }
 
-/// The children worth a row: every running one first, then the most recent others.
+/// The dock lists running children only, newest first; `/children` lists the rest.
 async fn load_rows(sources: &Sources, turn_active: bool) -> Vec<ChildRow> {
     let mut rows =
         super::goose_children(&sources.session_manager, &sources.session_id, turn_active)
@@ -628,8 +628,8 @@ async fn load_rows(sources: &Sources, turn_active: bool) -> Vec<ChildRow> {
             rows.extend(router::dock_rows(&delegates, root, chrono::Utc::now()));
         }
     }
+    rows.retain(|row| row.status == ChildStatus::Running);
     rows.reverse();
-    rows.sort_by_key(|row| row.status != ChildStatus::Running);
     rows
 }
 
