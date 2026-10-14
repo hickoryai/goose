@@ -126,6 +126,14 @@ pub struct RouterDelegate {
     pub updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub has_response: bool,
+    /// The planner work this delegate runs, when router-acp's planner started it.
+    #[serde(default)]
+    pub work_id: Option<String>,
+    /// A planner worker's lifecycle from router-acp's durable work record: `running`
+    /// while its attempt is open, else the work's status (`review-pending`, `finished`,
+    /// `interrupted`, ...), or `ended` for a session a later one replaced.
+    #[serde(default)]
+    pub state: Option<String>,
     pub routing: Option<serde_json::Value>,
     #[serde(default)]
     pub log: Vec<RouterDelegateLog>,

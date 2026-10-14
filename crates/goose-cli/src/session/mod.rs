@@ -253,6 +253,9 @@ pub struct CliSession {
     loading_announced: bool,
     /// Records (and at the prompt, shows) what the agent says while no turn of ours runs.
     unsolicited: Option<unsolicited::UnsolicitedRelay>,
+    /// Prints router-acp planner workers' status at the prompt: the router session it
+    /// watches and the watcher.
+    router_status: Option<(String, AbortOnDropHandle<()>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +341,7 @@ impl CliSession {
             extension_loading,
             loading_announced: false,
             unsolicited: None,
+            router_status: None,
         }
     }
 
@@ -2089,6 +2093,7 @@ impl CliSession {
                 .is_some_and(|provider| relay.follows(provider, &self.session_id))
                 && (display.is_none() || relay.displays())
         });
+        let replaced = !current && provider.is_some();
         if let (false, Some(provider)) = (current, provider) {
             if let Some(previous) = self.unsolicited.take() {
                 previous.settle().await;
@@ -2110,6 +2115,39 @@ impl CliSession {
             );
         }
         self.take_unsolicited();
+        self.sync_router_status(replaced).await;
+    }
+
+    /// Keeps the prompt-time worker status following the router session this goose session
+    /// runs in, printed through the background-output relay.
+    async fn sync_router_status(&mut self, relay_replaced: bool) {
+        let notifier = self
+            .unsolicited
+            .as_ref()
+            .filter(|relay| relay.displays())
+            .map(|relay| relay.notifier());
+        let root = match notifier {
+            Some(_) => self.router_session_id().await,
+            None => None,
+        };
+        let (Some(notifier), Some(root)) = (notifier, root) else {
+            self.router_status = None;
+            return;
+        };
+        if !relay_replaced
+            && self
+                .router_status
+                .as_ref()
+                .is_some_and(|(id, _)| *id == root)
+        {
+            return;
+        }
+        self.router_status = RouterStateSource::configured().ok().map(|source| {
+            let watch = child_sessions::router::watch_status(source, root.clone(), move |line| {
+                notifier.notice(console::style(line).dim().to_string())
+            });
+            (root, watch)
+        });
     }
 
     /// The navigator over this session's children, including the delegates router-acp runs

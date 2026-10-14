@@ -13,8 +13,8 @@ use tokio_util::task::AbortOnDropHandle;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-/// The delegates panel has no lifecycle state, so a delegate that has logged nothing for
-/// this long without having answered is shown as stopped rather than running.
+/// A delegate router-acp reports no lifecycle state for (not a planner worker) that has
+/// logged nothing for this long without having answered is shown as stopped.
 const LIVE_WINDOW: chrono::Duration = chrono::Duration::minutes(3);
 const TASK_LINES: usize = 12;
 const ACTIVITY_CHARS: usize = 120;
@@ -104,6 +104,67 @@ impl RouterChildren {
     }
 }
 
+/// How often the prompt-time worker status is re-read.
+const STATUS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One line grouping the planner workers directly under `root` by lifecycle, running
+/// first, or `None` when router-acp reports none. A work's latest session stands for it.
+pub fn status_line(delegates: &[RouterDelegate], root: &str) -> Option<String> {
+    let mut states = std::collections::BTreeMap::new();
+    for delegate in delegates.iter().filter(|d| d.parent_id() == Some(root)) {
+        match delegate.state.as_deref() {
+            None | Some("ended") => {}
+            Some(state) => {
+                states.insert(delegate_label(delegate), state.to_string());
+            }
+        }
+    }
+    if states.is_empty() {
+        return None;
+    }
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (label, state) in states {
+        match groups.iter_mut().find(|(group, _)| *group == state) {
+            Some((_, labels)) => labels.push(label),
+            None => groups.push((state, vec![label])),
+        }
+    }
+    groups.sort_by_key(|(state, _)| (state != "running", state.clone()));
+    let parts: Vec<String> = groups
+        .into_iter()
+        .map(|(state, labels)| format!("{} {state}: {}", labels.len(), labels.join(", ")))
+        .collect();
+    Some(format!(
+        "◆ workers · {} · /children to open",
+        parts.join(" · ")
+    ))
+}
+
+/// Reports the planner workers' status line under `root` each time it changes, so an idle
+/// prompt shows what the router is running without opening the navigator.
+pub fn watch_status(
+    source: RouterStateSource,
+    root: String,
+    notify: impl Fn(String) + Send + 'static,
+) -> AbortOnDropHandle<()> {
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut last: Option<String> = None;
+        loop {
+            if let Ok(delegates) = source
+                .delegates(std::slice::from_ref(&root), QUERY_TIMEOUT)
+                .await
+            {
+                let line = status_line(&delegates, &root);
+                if line.is_some() && line != last {
+                    notify(line.clone().unwrap_or_default());
+                }
+                last = line;
+            }
+            tokio::time::sleep(STATUS_INTERVAL).await;
+        }
+    }))
+}
+
 pub fn rows_for(delegates: &[RouterDelegate], parent: &str, now: DateTime<Utc>) -> Vec<ChildRow> {
     delegates
         .iter()
@@ -117,7 +178,10 @@ pub fn rows_for(delegates: &[RouterDelegate], parent: &str, now: DateTime<Utc>) 
         .collect()
 }
 
-fn delegate_label(delegate: &RouterDelegate) -> String {
+pub fn delegate_label(delegate: &RouterDelegate) -> String {
+    if let Some(work_id) = &delegate.work_id {
+        return work_id.clone();
+    }
     let work_id = delegate.log.iter().find_map(|entry| {
         (entry.kind == "delegate_task")
             .then(|| entry.detail.as_ref()?.get("work_id")?.as_str())
@@ -131,6 +195,13 @@ fn delegate_label(delegate: &RouterDelegate) -> String {
 }
 
 pub fn delegate_status(delegate: &RouterDelegate, now: DateTime<Utc>) -> ChildStatus {
+    if let Some(state) = &delegate.state {
+        return match state.as_str() {
+            "running" | "allocating" | "admitted" => ChildStatus::Running,
+            "interrupted" | "blocked" | "corrections" => ChildStatus::Stopped,
+            _ => ChildStatus::Completed,
+        };
+    }
     let last = delegate
         .log
         .iter()
@@ -427,5 +498,54 @@ mod tests {
         let nested = rows_for(&delegates, &parent, now);
         assert_eq!(nested.len(), 1);
         assert_eq!(nested[0].id, format!("{parent}::delegate-nested"));
+    }
+
+    fn worker(id: &str, work_id: &str, state: &str) -> RouterDelegate {
+        parse_delegates(
+            serde_json::json!({"version": 1, "command": "delegates", "data": {"children": [{
+                "id": format!("{ROOT}::delegate-{id}"),
+                "title": "[router-acp planner role: implement-work] Policy identity...",
+                "workId": work_id,
+                "state": state,
+                "routing": {"parent": ROOT},
+                "log": [],
+            }]}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap()
+        .remove(0)
+    }
+
+    #[test]
+    fn router_lifecycle_state_and_work_id_win_over_log_recency() {
+        let long_ago = at("2020-01-01T00:00:00Z");
+        let running = worker("a", "lead-magnets", "running");
+        assert_eq!(delegate_label(&running), "lead-magnets");
+        assert_eq!(delegate_status(&running, long_ago), ChildStatus::Running);
+        assert_eq!(
+            delegate_status(&worker("b", "x", "review-pending"), long_ago),
+            ChildStatus::Completed
+        );
+        assert_eq!(
+            delegate_status(&worker("c", "x", "interrupted"), long_ago),
+            ChildStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn status_line_groups_latest_workers_running_first() {
+        let delegates = vec![
+            worker("1", "rhythm-training", "ended"),
+            worker("2", "rhythm-training", "running"),
+            worker("3", "lead-magnets", "running"),
+            worker("4", "secret-guard", "review-pending"),
+        ];
+        assert_eq!(
+            status_line(&delegates, ROOT).unwrap(),
+            "◆ workers · 2 running: lead-magnets, rhythm-training · 1 review-pending: secret-guard · /children to open"
+        );
+        assert!(status_line(&delegates, "another-session").is_none());
+        assert!(status_line(&captured(), ROOT).is_none());
     }
 }

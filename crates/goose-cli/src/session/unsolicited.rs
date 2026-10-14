@@ -125,10 +125,27 @@ impl UnsolicitedRelay {
         self.shared.settle().await;
     }
 
+    /// Prints status lines the way background output is printed (live at the prompt, held
+    /// while it is hidden) without recording them into the session.
+    pub fn notifier(&self) -> Notifier {
+        Notifier(self.shared.clone())
+    }
+
     /// Messages recorded into the session since the last call, for the caller's own copy of
     /// the conversation.
     pub fn take_recorded(&self) -> Vec<Message> {
         std::mem::take(&mut self.shared.state.lock().unwrap().recorded)
+    }
+}
+
+#[derive(Clone)]
+pub struct Notifier(Arc<Shared>);
+
+impl Notifier {
+    pub fn notice(&self, line: String) {
+        if let Some(display) = self.0.state.lock().unwrap().display.as_mut() {
+            display.notice(line);
+        }
     }
 }
 
@@ -255,6 +272,21 @@ impl Display {
         self.emit(tail, true);
         self.in_burst = false;
         self.thinking_header_shown = false;
+        if self.at_prompt {
+            // Status lines that arrived during the burst.
+            let held = std::mem::take(&mut self.held);
+            self.print(held);
+        }
+    }
+
+    /// One status line, kept out of a background turn's rendering.
+    fn notice(&mut self, line: String) {
+        if self.at_prompt && !self.in_burst {
+            self.print(line);
+        } else {
+            self.held.push_str(&line);
+            self.held.push('\n');
+        }
     }
 
     /// The external printer ends every print with a newline, so only whole lines go out

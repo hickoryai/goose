@@ -2,7 +2,7 @@
 //! Opened with Tab while a turn runs, or with `/children` between turns.
 
 mod keys;
-mod router;
+pub mod router;
 #[cfg(unix)]
 mod terminal;
 #[cfg(not(unix))]
