@@ -541,7 +541,12 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
                     .any(|message| message.metadata.output_token_limit_reached)
                     && output.accumulator.iter().all(is_empty_response)
             };
-            if !empty_output || successful_tool_response || emit.cancel_token().is_cancelled() {
+            // A provider that keeps its own conversation (an ACP agent) already holds the
+            // prompt: sending it again repeats the user's message to the agent, and asking the
+            // user to resend does the same. Its empty answer is an answer, e.g. a router that
+            // queued the message for a turn already running.
+            let answered = self.provider.manages_own_context();
+            if !empty_output || successful_tool_response || answered || emit.cancel_token().is_cancelled() {
                 break empty_output;
             }
             self.output().accumulator.clear();
@@ -564,6 +569,15 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
             return applied(self.take_output());
             };
 
+            if empty_output && !successful_tool_response && self.provider.manages_own_context() {
+                // Records the turn as answered without showing anything: an empty message is
+                // projected away, which would leave the user's message unanswered and infer again.
+                self.output().accumulator.clear();
+                let answered = Message::assistant()
+                    .with_text("(the agent's turn ended with no output)")
+                    .with_visibility(false, true);
+                self.emit_message(answered, emit);
+            }
             if empty_output && successful_tool_response {
                 let message = {
                     let mut output = self.output();
