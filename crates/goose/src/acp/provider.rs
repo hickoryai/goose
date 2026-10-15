@@ -38,7 +38,9 @@ use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY};
 use crate::permission::permission_confirmation::PrincipalType;
 use crate::permission::{Permission, PermissionConfirmation};
-use crate::providers::base::{MessageStream, PermissionRouting, Provider, UnsolicitedUpdate};
+use crate::providers::base::{
+    MessageStream, PermissionRouting, Provider, SteerOutcome, UnsolicitedUpdate,
+};
 use crate::subprocess::configure_subprocess;
 use crate::token_counter::create_token_counter;
 use crate::utils::sanitize_unicode_tags;
@@ -103,6 +105,11 @@ enum ClientRequest {
         response_tx: mpsc::Sender<AcpUpdate>,
     },
 }
+
+/// ACP extension request that injects a user message into the session's running turn.
+const SESSION_STEERING_METHOD: &str = "_session/steering";
+
+type SharedConnection = Arc<Mutex<Option<ConnectionTo<Agent>>>>;
 
 // tokio I/O handles can't move between runtimes, so the child process must be
 // spawned inside the OS thread. This closure lets start() share all other logic.
@@ -442,6 +449,11 @@ pub struct AcpProvider {
     unsolicited: broadcast::Sender<UnsolicitedUpdate>,
     unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
 
+    /// The live connection, for requests that must not wait behind a prompt in flight.
+    connection: SharedConnection,
+    /// Set once the agent answered `_session/steering` with method-not-found.
+    steering_unsupported: AtomicBool,
+
     tx: Option<mpsc::Sender<ClientRequest>>,
     cancel_tx: Option<oneshot::Sender<()>>,
     loop_thread: Option<JoinHandle<()>>,
@@ -538,6 +550,7 @@ impl AcpProvider {
             Arc::new(Mutex::new(HashMap::new()));
         let context_size = Arc::new(AtomicU64::new(0));
         let effort = AcpEffortState::new();
+        let connection = SharedConnection::default();
         let (unsolicited_tx, unsolicited_rx) = mpsc::unbounded_channel();
         let (unsolicited, _) = broadcast::channel(UNSOLICITED_CAPACITY);
         tokio::spawn(relay_unsolicited(unsolicited_rx, unsolicited.clone()));
@@ -548,6 +561,7 @@ impl AcpProvider {
             context_size.clone(),
             effort.clone(),
             unsolicited_tx.clone(),
+            connection.clone(),
         );
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx, cancel_rx));
@@ -595,6 +609,8 @@ impl AcpProvider {
             effort,
             unsolicited,
             unsolicited_tx,
+            connection,
+            steering_unsupported: AtomicBool::new(false),
             tx: client_loop_guard.tx.take(),
             cancel_tx: client_loop_guard.cancel_tx.take(),
             loop_thread: client_loop_guard.thread.take(),
@@ -905,6 +921,38 @@ impl Provider for AcpProvider {
 
     fn subscribe_unsolicited(&self) -> Option<broadcast::Receiver<UnsolicitedUpdate>> {
         Some(self.unsolicited.subscribe())
+    }
+
+    /// `_session/steering` on the active session. It goes straight onto the connection: the
+    /// request loop is busy with the very prompt being steered.
+    async fn steer(&self, text: &str) -> Result<SteerOutcome, ProviderError> {
+        if self.steering_unsupported.load(Ordering::Acquire) {
+            return Ok(SteerOutcome::Unsupported);
+        }
+        let Some(cx) = self.connection.lock().unwrap().clone() else {
+            return Ok(SteerOutcome::Declined);
+        };
+        let request = agent_client_protocol::UntypedMessage::new(
+            SESSION_STEERING_METHOD,
+            serde_json::json!({
+                "sessionId": self.acp_session_id(),
+                "prompt": [ContentBlock::Text(TextContent::new(text))],
+            }),
+        )
+        .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
+        match cx.send_request(request).block_task().await {
+            Ok(response) => Ok(
+                match response.get("outcome").and_then(|outcome| outcome.as_str()) {
+                    Some("injected") => SteerOutcome::Injected,
+                    _ => SteerOutcome::Declined,
+                },
+            ),
+            Err(error) if error.code == agent_client_protocol::ErrorCode::MethodNotFound => {
+                self.steering_unsupported.store(true, Ordering::Release);
+                Ok(SteerOutcome::Unsupported)
+            }
+            Err(error) => Err(provider_error_from_acp(error)),
+        }
     }
 
     async fn set_thinking_effort(
@@ -1238,6 +1286,7 @@ struct AcpClientLoop {
     context_size: Arc<AtomicU64>,
     effort: AcpEffortState,
     unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
+    connection: SharedConnection,
 }
 
 impl AcpClientLoop {
@@ -1248,6 +1297,7 @@ impl AcpClientLoop {
         context_size: Arc<AtomicU64>,
         effort: AcpEffortState,
         unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
+        connection: SharedConnection,
     ) -> Self {
         Self {
             config,
@@ -1257,6 +1307,7 @@ impl AcpClientLoop {
             context_size,
             effort,
             unsolicited_tx,
+            connection,
         }
     }
 
@@ -1313,6 +1364,7 @@ impl AcpClientLoop {
             context_size,
             effort,
             unsolicited_tx,
+            connection,
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
@@ -1539,6 +1591,7 @@ impl AcpClientLoop {
                 agent_client_protocol::on_receive_request!(),
             )
             .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
+                *connection.lock().unwrap() = Some(cx.clone());
                 handle_requests(
                     config,
                     goose_mode,
@@ -2657,6 +2710,8 @@ mod tests {
                 effort: AcpEffortState::new(),
                 unsolicited: broadcast::channel(1).0,
                 unsolicited_tx: mpsc::unbounded_channel().0,
+                connection: SharedConnection::default(),
+                steering_unsupported: AtomicBool::new(false),
                 tx,
                 cancel_tx: None,
                 loop_thread: None,
@@ -4996,5 +5051,106 @@ mod tests {
             updates.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    /// A message steered into a running prompt reaches the agent while the prompt is still in
+    /// flight; an agent without `_session/steering` reports it unsupported.
+    #[tokio::test]
+    async fn steering_reaches_the_agent_during_a_prompt() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+            PromptRequest, PromptResponse,
+        };
+        use agent_client_protocol::{
+            on_receive_request, Agent as ScriptedAgent, ByteStreams, UntypedMessage,
+        };
+        use futures::StreamExt;
+
+        async fn connect(steerable: bool) -> (AcpProvider, Arc<Mutex<Vec<serde_json::Value>>>) {
+            let (client_read, agent_write) = tokio::io::duplex(64 * 1024);
+            let (agent_read, client_write) = tokio::io::duplex(64 * 1024);
+            let steered = Arc::new(Mutex::new(Vec::new()));
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (agent_steered, agent_release) = (steered.clone(), release.clone());
+            tokio::spawn(async move {
+                let builder = ScriptedAgent
+                    .builder()
+                    .on_receive_request(
+                        async |_req: InitializeRequest, responder, _cx| {
+                            responder.respond(
+                                InitializeResponse::new(ProtocolVersion::LATEST)
+                                    .agent_capabilities(AgentCapabilities::new()),
+                            )
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async |_req: NewSessionRequest, responder, _cx| {
+                            responder.respond(NewSessionResponse::new(SessionId::new("steer-me")))
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async move |_req: PromptRequest, responder, cx| {
+                            let release = agent_release.clone();
+                            cx.spawn(async move {
+                                release.notified().await;
+                                responder.respond(PromptResponse::new(StopReason::EndTurn))
+                            })
+                        },
+                        on_receive_request!(),
+                    );
+                let transport = ByteStreams::new(agent_write.compat_write(), agent_read.compat());
+                if steerable {
+                    builder
+                        .on_receive_request(
+                            async move |req: UntypedMessage, responder, _cx| {
+                                agent_steered.lock().unwrap().push(req.params().clone());
+                                release.notify_one();
+                                responder.respond(serde_json::json!({"outcome": "injected"}))
+                            },
+                            on_receive_request!(),
+                        )
+                        .connect_to(transport)
+                        .await
+                } else {
+                    builder.connect_to(transport).await
+                }
+            });
+            let provider = AcpProvider::connect_with_transport(
+                "router-acp".to_string(),
+                GooseMode::Auto,
+                test_acp_config(HashMap::new(), None),
+                ByteStreams::new(client_write.compat_write(), client_read.compat()),
+            )
+            .await
+            .unwrap();
+            (provider, steered)
+        }
+
+        let (provider, steered) = connect(true).await;
+        let model = ModelConfig::new("test-model");
+        let mut stream = provider
+            .stream(&model, "", &[Message::user().with_text("work")], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.steer("also this").await.unwrap(),
+            SteerOutcome::Injected
+        );
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        let steered = steered.lock().unwrap().clone();
+        assert_eq!(steered.len(), 1);
+        assert_eq!(steered[0]["sessionId"], "steer-me");
+        assert_eq!(steered[0]["prompt"][0]["text"], "also this");
+
+        let (provider, _) = connect(false).await;
+        assert_eq!(
+            provider.steer("hello").await.unwrap(),
+            SteerOutcome::Unsupported
+        );
+        assert!(provider.steering_unsupported.load(Ordering::Acquire));
     }
 }

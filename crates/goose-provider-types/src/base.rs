@@ -525,6 +525,17 @@ pub enum UnsolicitedUpdate {
     Settled,
 }
 
+/// What became of user guidance handed to a provider's running turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// The agent took the message into the turn it is running.
+    Injected,
+    /// The agent could not take it right now; it may at a later point in the turn.
+    Declined,
+    /// The provider's agent takes no guidance mid-turn; goose's own loop has to deliver it.
+    Unsupported,
+}
+
 /// Base trait for AI providers (OpenAI, Anthropic, etc)
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -751,6 +762,12 @@ pub trait Provider: MaybeSend + MaybeSync {
     /// agent only ever speaks when prompted return `None`.
     fn subscribe_unsolicited(&self) -> Option<broadcast::Receiver<UnsolicitedUpdate>> {
         None
+    }
+
+    /// Hand user guidance to the turn the provider's own agent is running, without
+    /// interrupting it. Providers whose turns goose's loop drives return `Unsupported`.
+    async fn steer(&self, _text: &str) -> Result<SteerOutcome, ProviderError> {
+        Ok(SteerOutcome::Unsupported)
     }
 
     /// Forward a thinking-effort selection to the provider. Returns `Ok(true)`

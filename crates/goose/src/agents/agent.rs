@@ -323,6 +323,23 @@ impl Agent {
             .push_back(message);
     }
 
+    /// Hands `text` to the session's running turn without interrupting it. A provider that
+    /// runs its own agent loop takes it directly (`Injected`, or `Declined` while it cannot,
+    /// leaving the message with the caller). Otherwise (`Unsupported`) it waits in goose's
+    /// loop, which adds it between model and tool turns and yields it in the reply stream.
+    pub async fn steer_running_turn(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<crate::providers::base::SteerOutcome> {
+        let outcome = self.provider(session_id).await?.steer(text).await?;
+        if outcome == crate::providers::base::SteerOutcome::Unsupported {
+            self.steer(session_id, Message::user().with_text(text))
+                .await;
+        }
+        Ok(outcome)
+    }
+
     pub async fn discard_pending_steers(&self, session_id: &str) {
         self.steer_queues.lock().await.remove(session_id);
     }
