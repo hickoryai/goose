@@ -53,8 +53,10 @@ pub enum Typed {
 #[derive(Default)]
 struct State {
     rows: Vec<ChildRow>,
-    /// Router sessions keep the list's rows for a whole turn, since their children appear
-    /// mid-turn and rows can only be reserved on a fresh line.
+    /// Router sessions keep the list's rows at all times, at the prompt as well as during a
+    /// turn. Rows can only be reserved on a fresh line (a turn's start or end), so a list sized
+    /// by the children known at that moment vanished whenever they were not known yet (a new
+    /// dock) or a query had just failed, and stayed gone until the next fresh line.
     always_list: bool,
     selected: Option<usize>,
     /// The first child row shown; follows the selection through a longer list.
@@ -104,8 +106,7 @@ impl Dock {
         let task = tokio::spawn(async move {
             loop {
                 let turn_active = painter.state.lock().unwrap().turn_active;
-                let rows = load_rows(&sources, turn_active).await;
-                painter.update(rows);
+                painter.update(load_rows(&sources, turn_active).await);
                 tokio::time::sleep(REPAINT).await;
             }
         });
@@ -348,7 +349,8 @@ impl Drop for ExtendedKeys {
 
 /// Text typed during the last turn and never sent, for the next prompt to start from.
 pub fn take_draft() -> String {
-    with_active(|shared| std::mem::take(&mut shared.state.lock().unwrap().draft)).unwrap_or_default()
+    with_active(|shared| std::mem::take(&mut shared.state.lock().unwrap().draft))
+        .unwrap_or_default()
 }
 
 pub fn is_capable() -> bool {
@@ -411,7 +413,7 @@ struct Layout {
 
 impl Layout {
     fn of(state: &State, (cols, lines): (usize, usize)) -> Self {
-        let wanted = !state.rows.is_empty() || (state.always_list && state.input.is_some());
+        let wanted = state.always_list || !state.rows.is_empty();
         let list = if wanted && lines >= 8 {
             (MAX_ROWS + 1).min(lines / 3).max(2)
         } else {
@@ -434,8 +436,9 @@ impl Layout {
 }
 
 impl Shared {
-    fn update(&self, rows: Vec<ChildRow>) {
-        {
+    /// New rows from a load; `None` (a failed query) keeps the rows already shown.
+    fn update(&self, rows: Option<Vec<ChildRow>>) {
+        if let Some(rows) = rows {
             let mut state = self.state.lock().unwrap();
             if let Some(selected) = state.selected {
                 let id = state.rows.get(selected).map(|row| row.id.clone());
@@ -562,7 +565,14 @@ fn shown_layout(state: &State, size: (usize, usize)) -> Layout {
 fn window(state: &State, layout: Layout) -> (usize, bool) {
     let slots = layout.child_slots();
     let overflow = state.rows.len() > slots;
-    (if overflow { slots.saturating_sub(1) } else { slots }, overflow)
+    (
+        if overflow {
+            slots.saturating_sub(1)
+        } else {
+            slots
+        },
+        overflow,
+    )
 }
 
 /// Scrolls the list so the selected child is shown; without a selection it shows the top.
@@ -726,23 +736,24 @@ fn header(state: &State, cols: usize) -> String {
         .to_string()
 }
 
-/// The dock lists running children only, newest first; `/children` lists the rest.
-async fn load_rows(sources: &Sources, turn_active: bool) -> Vec<ChildRow> {
+/// The dock lists running children only, newest first; `/children` lists the rest. `None`
+/// when a source could not be read (router-acp's state query times out under load), so a
+/// failed read never blanks a list of children that are still running.
+async fn load_rows(sources: &Sources, turn_active: bool) -> Option<Vec<ChildRow>> {
     let mut rows =
         super::goose_children(&sources.session_manager, &sources.session_id, turn_active)
             .await
-            .unwrap_or_default();
+            .ok()?;
     if let Some((source, root)) = &sources.router {
-        if let Ok(delegates) = source
+        let delegates = source
             .delegates(std::slice::from_ref(root), QUERY_TIMEOUT)
             .await
-        {
-            rows.extend(router::dock_rows(&delegates, root, chrono::Utc::now()));
-        }
+            .ok()?;
+        rows.extend(router::dock_rows(&delegates, root, chrono::Utc::now()));
     }
     rows.retain(|row| row.status == ChildStatus::Running);
     rows.reverse();
-    rows
+    Some(rows)
 }
 
 fn terminal_size() -> (usize, usize) {
@@ -818,7 +829,10 @@ mod tests {
     #[test]
     fn a_frame_paints_only_the_footer_rows_and_restores_the_cursor() {
         let state = State {
-            rows: vec![row("a", ChildStatus::Running), row("b", ChildStatus::Completed)],
+            rows: vec![
+                row("a", ChildStatus::Running),
+                row("b", ChildStatus::Completed),
+            ],
             input: Some(InputLine::default()),
             reserved: 4,
             size: (80, 30),
@@ -829,14 +843,19 @@ mod tests {
         assert!(frame.ends_with("\x1b8"));
         assert!(frame.contains("\x1b[30;1H") && !frame.contains("\x1b[26;1H"));
         let plain = console::strip_ansi_codes(&frame).to_string();
-        assert!(frame.contains("\x1b[?25l"), "the input line's caret is the only cursor");
+        assert!(
+            frame.contains("\x1b[?25l"),
+            "the input line's caret is the only cursor"
+        );
         assert!(plain.contains("Ctrl+Enter interrupts") && plain.contains("children · 1 running"));
     }
 
     #[test]
     fn the_list_scrolls_to_keep_the_selection_in_view() {
         let mut state = State {
-            rows: (0..10).map(|i| row(&i.to_string(), ChildStatus::Running)).collect(),
+            rows: (0..10)
+                .map(|i| row(&i.to_string(), ChildStatus::Running))
+                .collect(),
             reserved: 4,
             size: (80, 30),
             ..State::default()
@@ -858,7 +877,9 @@ mod tests {
     #[test]
     fn more_children_than_rows_collapse_into_a_count() {
         let state = State {
-            rows: (0..5).map(|i| row(&i.to_string(), ChildStatus::Running)).collect(),
+            rows: (0..5)
+                .map(|i| row(&i.to_string(), ChildStatus::Running))
+                .collect(),
             reserved: 3,
             size: (80, 30),
             ..State::default()
@@ -871,7 +892,11 @@ mod tests {
         assert_eq!(next_selection(None, 2, 1), Some(0));
         assert_eq!(next_selection(Some(0), 2, 1), Some(1));
         assert_eq!(next_selection(Some(1), 2, 1), Some(1));
-        assert_eq!(next_selection(Some(7), 9, 1), Some(8), "no cap at the visible rows");
+        assert_eq!(
+            next_selection(Some(7), 9, 1),
+            Some(8),
+            "no cap at the visible rows"
+        );
         assert_eq!(next_selection(Some(1), 2, -1), Some(0));
         assert_eq!(next_selection(Some(0), 2, -1), None);
         assert_eq!(next_selection(None, 0, 1), None);
@@ -884,7 +909,11 @@ mod tests {
             assert_eq!(dock.type_key(Key::Char(c)), Typed::Edited);
         }
         assert_eq!(dock.type_key(Key::Enter), Typed::Queued);
-        assert_eq!(dock.type_key(Key::Enter), Typed::Ignored, "an empty line queues nothing");
+        assert_eq!(
+            dock.type_key(Key::Enter),
+            Typed::Ignored,
+            "an empty line queues nothing"
+        );
         for c in "secnd".chars() {
             dock.type_key(Key::Char(c));
         }
@@ -1064,5 +1093,69 @@ mod tests {
         state.rows = vec![row("a", ChildStatus::Running)];
         state.reserved = 4;
         assert_eq!(shown_layout(&state, (20, 40)), Layout { input: 3, list: 1 });
+    }
+
+    /// The operator's report: after a message the dock and even its empty area went away
+    /// until `/children` was closed. The turn's end re-reserved the footer from the rows known
+    /// at that instant, and at the prompt a router dock was only wanted with rows in hand.
+    #[test]
+    fn a_router_dock_keeps_its_rows_at_the_prompt_without_children_in_hand() {
+        let prompt = State {
+            always_list: true,
+            ..State::default()
+        };
+        assert_eq!(Layout::of(&prompt, (80, 40)), Layout { input: 0, list: 7 });
+        let turn = State {
+            always_list: true,
+            input: Some(InputLine::default()),
+            ..State::default()
+        };
+        assert_eq!(Layout::of(&turn, (80, 40)), Layout { input: 1, list: 7 });
+        let plain = console::strip_ansi_codes(&frame(
+            &State {
+                reserved: 7,
+                size: (80, 40),
+                ..prompt
+            },
+            80,
+            40,
+        ))
+        .to_string();
+        assert!(plain.contains("children · none running"), "{plain}");
+        // Goose's own subagents keep a dock only while there are children to list.
+        assert_eq!(Layout::of(&State::default(), (80, 40)).height(), 0);
+    }
+
+    #[test]
+    fn a_five_row_message_leaves_the_dock_its_header_and_a_child() {
+        let text = "x".repeat(400);
+        let mut state = input_state(&text, 400, 0);
+        state.always_list = true;
+        state.rows = (0..4)
+            .map(|i| row(&i.to_string(), ChildStatus::Running))
+            .collect();
+        state.size = (80, 40);
+        // Reserved at the turn's start for a one-row input line under seven dock rows.
+        state.reserved = 8;
+        let layout = shown_layout(&state, state.size);
+        assert_eq!(layout, Layout { input: 5, list: 3 });
+        let plain = console::strip_ansi_codes(&frame(&state, 80, 40)).to_string();
+        assert!(plain.contains("children · 4 running"), "{plain}");
+        assert!(plain.contains("↓ 3 more"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_keeps_the_children_already_shown() {
+        let dock = typing();
+        let rows = |dock: &Dock| dock.shared.state.lock().unwrap().rows.len();
+        dock.shared.update(Some(vec![
+            row("a", ChildStatus::Running),
+            row("b", ChildStatus::Running),
+        ]));
+        assert_eq!(rows(&dock), 2);
+        dock.shared.update(None);
+        assert_eq!(rows(&dock), 2, "a timed-out query is not an empty list");
+        dock.shared.update(Some(Vec::new()));
+        assert_eq!(rows(&dock), 0);
     }
 }
