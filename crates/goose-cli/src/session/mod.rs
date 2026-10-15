@@ -68,6 +68,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const SHELL_STATUS_FALLBACK_WIDTH: usize = 120;
+/// How often a message the running turn declined is offered to it again.
+const STEER_RETRY: Duration = Duration::from_secs(2);
+/// How long a turn that ended waits for a message on its way to it.
+const STEER_SETTLE: Duration = Duration::from_secs(5);
+/// How long a message may be on its way to the running turn before it counts as declined.
+const STEER_TIMEOUT: Duration = Duration::from_secs(30);
 const SHELL_STATUS_MAX_LINES: usize = 3;
 const SHELL_STATUS_RESERVED_WIDTH: usize = 2;
 
@@ -1397,6 +1403,10 @@ impl CliSession {
         }
         let mut deferred_messages: Vec<Message> = Vec::new();
         let mut refresh_children = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
+        // Messages queued in the footer reach the running turn one at a time.
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut steer_retry = tokio::time::interval(STEER_RETRY);
+        let mut handed_to_goose: Vec<String> = Vec::new();
 
         use futures::StreamExt;
         loop {
@@ -1431,8 +1441,14 @@ impl CliSession {
                                 }
                                 Key::Click { row, .. } => dock.select_row(row),
                                 key => {
-                                    if dock.type_key(key) == child_sessions::dock::Typed::SendNow {
-                                        cancel_token_clone.cancel();
+                                    match dock.type_key(key) {
+                                        child_sessions::dock::Typed::SendNow => {
+                                            cancel_token_clone.cancel()
+                                        }
+                                        child_sessions::dock::Typed::Queued => {
+                                            self.start_steer(&steer_tx)
+                                        }
+                                        _ => {}
                                     }
                                     None
                                 }
@@ -1454,6 +1470,25 @@ impl CliSession {
                     if was_open && !children.is_open() {
                         render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                     }
+                }
+                Some((text, outcome)) = steer_rx.recv() => {
+                    let Some(dock) = self.dock() else { continue };
+                    let (delivered, echo) = settle_steer(dock, text, outcome, &mut handed_to_goose);
+                    if let Some(echo) = &echo {
+                        if children.is_open() {
+                            deferred_messages.push(echo.clone());
+                        } else {
+                            output::hide_thinking();
+                            let _ = progress_bars.hide();
+                            output::render_message_streaming(echo, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                        }
+                    }
+                    if delivered {
+                        self.start_steer(&steer_tx);
+                    }
+                }
+                _ = steer_retry.tick(), if self.dock().is_some_and(|dock| dock.has_queued()) => {
+                    self.start_steer(&steer_tx);
                 }
                 _ = refresh_children.tick(), if children.is_open() || children.watches_router() => {
                     if children.is_open() {
@@ -1670,6 +1705,28 @@ impl CliSession {
             }
         }
         drop(children);
+        if let Some(dock) = self.dock() {
+            if dock.is_steering() {
+                match tokio::time::timeout(STEER_SETTLE, steer_rx.recv()).await {
+                    Ok(Some((text, outcome))) => {
+                        deferred_messages
+                            .extend(settle_steer(dock, text, outcome, &mut handed_to_goose).1);
+                    }
+                    _ => dock.finish_steer(false),
+                }
+            }
+            // Messages goose's loop never got to add go out with the rest after the turn.
+            handed_to_goose.retain(|text| {
+                !self
+                    .messages
+                    .iter()
+                    .any(|message| message.metadata.steer && message.as_concat_text() == *text)
+            });
+            if !handed_to_goose.is_empty() {
+                self.agent.discard_pending_steers(&self.session_id).await;
+                dock.requeue(handed_to_goose);
+            }
+        }
         render_deferred(
             &mut deferred_messages,
             &mut markdown_buffer,
@@ -2224,6 +2281,33 @@ impl CliSession {
         self.dock.as_ref().map(|(_, dock)| dock)
     }
 
+    /// Hands the footer's oldest queued message to the running turn, unless one is on its way;
+    /// the outcome arrives on `outcomes`.
+    fn start_steer(
+        &self,
+        outcomes: &tokio::sync::mpsc::UnboundedSender<(
+            String,
+            Result<goose::providers::base::SteerOutcome>,
+        )>,
+    ) {
+        let Some(text) = self.dock().and_then(|dock| dock.next_steer()) else {
+            return;
+        };
+        let (agent, session_id, outcomes) = (
+            self.agent.clone(),
+            self.session_id.clone(),
+            outcomes.clone(),
+        );
+        tokio::spawn(async move {
+            // A turn that never answers must not hold up the messages queued behind this one.
+            let outcome =
+                tokio::time::timeout(STEER_TIMEOUT, agent.steer_running_turn(&session_id, &text))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer to the steer in time")));
+            let _ = outcomes.send((text, outcome));
+        });
+    }
+
     /// ↓ on an empty prompt: ↑/↓ choose a child, Enter (or a click) opens it in the
     /// navigator, Esc or ↑ past the first row returns to the prompt.
     async fn focus_dock(&mut self) {
@@ -2416,6 +2500,32 @@ async fn drain_stopped_run(
             _ => {}
         }
     }
+}
+
+/// Records what became of a message handed to the running turn: whether it was delivered,
+/// and the message to show when the turn took it directly. One goose's loop took shows when
+/// the loop adds it.
+fn settle_steer(
+    dock: &child_sessions::dock::Dock,
+    text: String,
+    outcome: Result<goose::providers::base::SteerOutcome>,
+    handed_to_goose: &mut Vec<String>,
+) -> (bool, Option<Message>) {
+    use goose::providers::base::SteerOutcome;
+    let settled = match outcome {
+        Ok(SteerOutcome::Injected) => (true, Some(Message::user().with_text(&text).with_steer())),
+        Ok(SteerOutcome::Unsupported) => {
+            handed_to_goose.push(text);
+            (true, None)
+        }
+        Ok(SteerOutcome::Declined) => (false, None),
+        Err(error) => {
+            tracing::warn!(%error, "could not hand a queued message to the running turn");
+            (false, None)
+        }
+    };
+    dock.finish_steer(settled.0);
+    settled
 }
 
 fn render_deferred(

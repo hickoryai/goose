@@ -2,6 +2,12 @@
 //! agent, and the dock, a persistent list of the session's children. A scroll region keeps the
 //! session's own output and the line editor above these rows, and a background task repaints
 //! them as the children work. The footer reads no input itself: the session feeds it keys.
+//!
+//! Enter queues the typed message; the session hands queued messages to the running turn one
+//! at a time (`next_steer`, `finish_steer`) and sends whatever is left when the turn ends.
+//! Up on an empty input line takes the newest undelivered message back for editing; Down
+//! moves into the dock. While the input line shows, it draws the only cursor: the terminal's
+//! own stays hidden until the turn ends.
 
 use super::router;
 use super::view::{self, ChildRow, ChildStatus};
@@ -18,6 +24,10 @@ const REPAINT: Duration = Duration::from_secs(1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Child rows the dock shows below its header; more collapse into a "+N more" row.
 const MAX_ROWS: usize = 6;
+/// Rows a long message may wrap onto; a longer one shows the rows around the caret.
+const MAX_INPUT_ROWS: usize = 5;
+/// The input line's "› " gutter.
+const GUTTER: usize = 2;
 
 /// The live footer, so a full-screen view or child process can hand the screen back and forth.
 static ACTIVE: OnceLock<Mutex<Weak<Shared>>> = OnceLock::new();
@@ -33,7 +43,7 @@ struct InputLine {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Typed {
     Edited,
-    /// Enter: the message waits for the turn to end.
+    /// Enter: the message is queued for the running turn, without interrupting it.
     Queued,
     /// Ctrl+Enter: end the turn now and send what is queued.
     SendNow,
@@ -50,7 +60,10 @@ struct State {
     /// The first child row shown; follows the selection through a longer list.
     offset: usize,
     input: Option<InputLine>,
+    /// Messages not yet delivered, oldest first.
     queued: Vec<String>,
+    /// The queued message being handed to the running turn; counted as queued until then.
+    steering: Option<String>,
     /// Text typed during a turn that was never sent; it fills the next prompt.
     draft: String,
     /// Rows reserved at the bottom of the screen; 0 while none are.
@@ -116,6 +129,7 @@ impl Dock {
     /// Before the prompt: the input line goes (unsent text becomes the prompt's draft) and the
     /// footer shrinks to the dock.
     pub fn end_turn(&self) {
+        show_cursor();
         {
             let mut state = self.shared.state.lock().unwrap();
             state.turn_active = false;
@@ -129,10 +143,55 @@ impl Dock {
         self.shared.fit();
     }
 
-    /// Messages queued during the last turn, joined into the next one to send.
+    /// Messages queued during the last turn and never delivered, joined into the next one to
+    /// send.
     pub fn take_queued(&self) -> Option<String> {
-        let queued = std::mem::take(&mut self.shared.state.lock().unwrap().queued);
+        let queued = {
+            let mut state = self.shared.state.lock().unwrap();
+            let mut queued: Vec<String> = state.steering.take().into_iter().collect();
+            queued.append(&mut state.queued);
+            queued
+        };
         (!queued.is_empty()).then(|| queued.join("\n\n"))
+    }
+
+    /// The oldest queued message, to hand to the running turn; none while one is on its way.
+    pub fn next_steer(&self) -> Option<String> {
+        let mut state = self.shared.state.lock().unwrap();
+        if state.steering.is_some() || state.queued.is_empty() {
+            return None;
+        }
+        let text = state.queued.remove(0);
+        state.steering = Some(text.clone());
+        Some(text)
+    }
+
+    /// The message from `next_steer` reached the turn, or goes back to the front of the queue.
+    pub fn finish_steer(&self, delivered: bool) {
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            if let Some(text) = state.steering.take().filter(|_| !delivered) {
+                state.queued.insert(0, text);
+            }
+        }
+        self.shared.paint();
+    }
+
+    /// Messages that left the queue but never reached the turn go back to its front.
+    pub fn requeue(&self, texts: Vec<String>) {
+        if texts.is_empty() {
+            return;
+        }
+        self.shared.state.lock().unwrap().queued.splice(0..0, texts);
+        self.shared.paint();
+    }
+
+    pub fn is_steering(&self) -> bool {
+        self.shared.state.lock().unwrap().steering.is_some()
+    }
+
+    pub fn has_queued(&self) -> bool {
+        !self.shared.state.lock().unwrap().queued.is_empty()
     }
 
     /// A key typed while a turn runs and the dock is not selecting.
@@ -174,6 +233,15 @@ impl Dock {
                     *input = InputLine::default();
                     Typed::Edited
                 }
+                // The newest undelivered message comes back for editing; Enter queues it again.
+                Key::Up if input.text.is_empty() => match state.queued.pop() {
+                    Some(text) => {
+                        input.text = text.chars().collect();
+                        input.cursor = input.text.len();
+                        Typed::Edited
+                    }
+                    None => Typed::Ignored,
+                },
                 Key::Enter | Key::SendNow => {
                     let text: String = std::mem::take(input).text.into_iter().collect();
                     if !text.trim().is_empty() {
@@ -198,7 +266,9 @@ impl Dock {
 
     pub fn selected(&self) -> Option<ChildRow> {
         let state = self.shared.state.lock().unwrap();
-        state.selected.and_then(|index| state.rows.get(index).cloned())
+        state
+            .selected
+            .and_then(|index| state.rows.get(index).cloned())
     }
 
     pub fn is_selecting(&self) -> bool {
@@ -234,8 +304,8 @@ impl Dock {
         let child = {
             let mut state = self.shared.state.lock().unwrap();
             let lines = state.size.1;
-            let layout = shown_layout(&state, lines);
-            let first_child = lines.checked_sub(state.reserved)? + usize::from(layout.input) + 1;
+            let layout = shown_layout(&state, state.size);
+            let first_child = lines.checked_sub(state.reserved)? + layout.input + 1;
             let slot = (row as usize).checked_sub(first_child)?;
             let (shown, _) = window(&state, layout);
             let index = state.offset + slot;
@@ -251,6 +321,7 @@ impl Dock {
 impl Drop for Dock {
     fn drop(&mut self) {
         set_mouse(false);
+        show_cursor();
         self.shared.release();
     }
 }
@@ -306,7 +377,7 @@ pub fn take_focus_request() -> bool {
 pub fn suspend() {
     with_active(|shared| {
         shared.state.lock().unwrap().suspended = true;
-        write_raw("\x1b7\x1b[r\x1b8");
+        write_raw("\x1b7\x1b[r\x1b8\x1b[?25h");
     });
 }
 
@@ -329,31 +400,32 @@ fn with_active<R>(f: impl FnOnce(&Shared) -> R) -> Option<R> {
     Some(f(&shared))
 }
 
-/// How the footer's rows are split: the input line (during a turn) above the dock's header
-/// and child rows.
+/// How the footer's rows are split: the input line's rows (during a turn) above the dock's
+/// header and child rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Layout {
-    input: bool,
+    input: usize,
     /// Dock rows, header included; 0 when there is no dock.
     list: usize,
 }
 
 impl Layout {
-    fn of(state: &State, lines: usize) -> Self {
+    fn of(state: &State, (cols, lines): (usize, usize)) -> Self {
         let wanted = !state.rows.is_empty() || (state.always_list && state.input.is_some());
         let list = if wanted && lines >= 8 {
             (MAX_ROWS + 1).min(lines / 3).max(2)
         } else {
             0
         };
-        Self {
-            input: state.input.is_some() && lines >= 4,
-            list,
-        }
+        let input = match &state.input {
+            Some(input) if lines >= 4 => input_lines(input.text.len(), cols).min(MAX_INPUT_ROWS),
+            _ => 0,
+        };
+        Self { input, list }
     }
 
     fn height(self) -> usize {
-        usize::from(self.input) + self.list
+        self.input + self.list
     }
 
     fn child_slots(self) -> usize {
@@ -389,7 +461,7 @@ impl Shared {
         if state.suspended {
             return;
         }
-        let height = Layout::of(&state, lines).height();
+        let height = Layout::of(&state, (cols, lines)).height();
         if height == state.reserved && state.size == (cols, lines) {
             drop(state);
             self.paint();
@@ -421,7 +493,9 @@ impl Shared {
             return;
         }
         write_raw(&release_sequence(state.reserved, state.size.1));
-        state.reserved = Layout::of(&state, lines).height().min(state.reserved);
+        state.reserved = Layout::of(&state, (cols, lines))
+            .height()
+            .min(state.reserved);
         state.size = (cols, lines);
         write_raw(&region_sequence(state.reserved, lines));
     }
@@ -469,16 +543,17 @@ fn release_sequence(height: usize, lines: usize) -> String {
     out
 }
 
-/// One write that paints every footer row and puts the cursor back where the output left it.
-/// The rows are laid out within what is reserved, which may be less than the layout wants
-/// until the next fresh line lets the footer grow.
 /// The layout as painted: what the layout wants, within what is reserved until the next fresh
-/// line lets the footer grow.
-fn shown_layout(state: &State, lines: usize) -> Layout {
-    let mut layout = Layout::of(state, lines);
+/// line lets the footer grow. A long message takes rows from the dock, which keeps its header.
+fn shown_layout(state: &State, size: (usize, usize)) -> Layout {
+    let mut layout = Layout::of(state, size);
     if layout.height() > state.reserved {
-        layout.input &= state.reserved > 0;
-        layout.list = state.reserved - usize::from(layout.input);
+        let header = usize::from(layout.list > 0);
+        layout.input = layout
+            .input
+            .min(state.reserved.saturating_sub(header))
+            .max(usize::from(layout.input > 0 && state.reserved > 0));
+        layout.list = state.reserved - layout.input;
     }
     layout
 }
@@ -492,7 +567,7 @@ fn window(state: &State, layout: Layout) -> (usize, bool) {
 
 /// Scrolls the list so the selected child is shown; without a selection it shows the top.
 fn follow_selection(state: &mut State) {
-    let (shown, _) = window(state, shown_layout(state, state.size.1));
+    let (shown, _) = window(state, shown_layout(state, state.size));
     state.offset = match state.selected {
         None => 0,
         Some(selected) if selected < state.offset => selected,
@@ -502,16 +577,21 @@ fn follow_selection(state: &mut State) {
     state.offset = state.offset.min(state.rows.len().saturating_sub(shown));
 }
 
+/// One write that paints every footer row and puts the cursor back where the output left it.
+/// While the input line shows, its caret is the only cursor: the terminal's own is hidden.
 fn frame(state: &State, cols: usize, lines: usize) -> String {
-    let layout = shown_layout(state, lines);
+    let layout = shown_layout(state, (cols, lines));
     let mut row = lines.saturating_sub(state.reserved) + 1;
     let mut out = String::from("\x1b7");
+    if state.input.is_some() {
+        out.push_str("\x1b[?25l");
+    }
     let mut line = |out: &mut String, text: String| {
         out.push_str(&format!("\x1b[{row};1H{text}\x1b[K"));
         row += 1;
     };
-    if layout.input {
-        line(&mut out, input_row(state, cols));
+    for text in input_rows(state, cols, layout.input) {
+        line(&mut out, text);
     }
     if layout.list > 0 {
         line(&mut out, header(state, cols));
@@ -545,41 +625,73 @@ fn frame(state: &State, cols: usize, lines: usize) -> String {
     out
 }
 
-fn input_row(state: &State, cols: usize) -> String {
+/// Rows a message of `len` characters wraps onto behind the gutter, with a cell for the caret
+/// after its last character.
+fn input_lines(len: usize, cols: usize) -> usize {
+    (len + 1).div_ceil(cols.saturating_sub(GUTTER).max(1))
+}
+
+/// The input line's `rows` rows: the message wrapped behind the "› " gutter, and the hint after
+/// it on the last row, shortened to the queue count or dropped when the text needs the room.
+/// A message taller than `rows` shows the rows around the caret.
+fn input_rows(state: &State, cols: usize, rows: usize) -> Vec<String> {
     let Some(input) = &state.input else {
-        return String::new();
+        return vec![String::new(); rows];
     };
-    let queued = match state.queued.len() {
-        0 => String::new(),
-        n => format!("{n} queued · "),
+    if rows == 0 {
+        return Vec::new();
+    }
+    let width = cols.saturating_sub(GUTTER).max(1);
+    let total = input_lines(input.text.len(), cols);
+    let caret_line = input.cursor / width;
+    let first = if total <= rows {
+        0
+    } else {
+        caret_line.saturating_sub(rows - 1).min(total - rows)
     };
-    let hint = format!(" {queued}Enter queues for the turn's end · Ctrl+Enter sends now");
-    let room = cols
-        .saturating_sub(console::measure_text_width(&hint) + 3)
-        .max(10);
-    // Keep the cursor in view: show the end of a line too long for the row.
-    let start = input.cursor.saturating_sub(room.saturating_sub(1));
-    let visible: String = input.text.iter().skip(start).take(room).collect();
-    let at = input.cursor - start;
-    let (before, rest): (String, String) = (
-        visible.chars().take(at).collect(),
-        visible.chars().skip(at).collect(),
-    );
-    let mut rest = rest.chars();
-    let under = rest.next().unwrap_or(' ');
-    let text = format!(
-        "{} {before}{}{}",
-        style("›").cyan().bold(),
-        style(under).reverse(),
-        rest.collect::<String>()
-    );
-    let width = console::measure_text_width(&text);
-    let hint = console::truncate_str(&hint, cols.saturating_sub(width), "").into_owned();
-    format!(
-        "{text}{}{}",
-        " ".repeat(cols.saturating_sub(width + console::measure_text_width(&hint))),
-        style(hint).dim()
-    )
+    let queued = state.queued.len() + usize::from(state.steering.is_some());
+    let hints = match queued {
+        0 => vec![" Enter sends mid-turn · Ctrl+Enter interrupts".to_string()],
+        n => vec![
+            format!(" {n} queued · ↑ edits · Enter sends mid-turn · Ctrl+Enter interrupts"),
+            format!(" {n} queued · ↑ edits"),
+            format!(" {n} queued"),
+        ],
+    };
+    (first..first + rows.min(total))
+        .map(|line| {
+            let start = line * width;
+            let chars: Vec<char> = input.text.iter().skip(start).take(width).copied().collect();
+            let mut text = if line == 0 {
+                format!("{} ", style("›").cyan().bold())
+            } else {
+                " ".repeat(GUTTER)
+            };
+            let mut used = GUTTER + chars.len();
+            for (offset, c) in chars.iter().enumerate() {
+                if start + offset == input.cursor {
+                    text.push_str(&style(c).reverse().to_string());
+                } else {
+                    text.push(*c);
+                }
+            }
+            if input.cursor >= start + chars.len() && input.cursor < start + width {
+                text.push_str(&style(' ').reverse().to_string());
+                used += 1;
+            }
+            if line + 1 == total {
+                let room = cols.saturating_sub(used);
+                if let Some(hint) = hints
+                    .iter()
+                    .find(|hint| console::measure_text_width(hint) <= room)
+                {
+                    let pad = room - console::measure_text_width(hint);
+                    text.push_str(&format!("{}{}", " ".repeat(pad), style(hint).dim()));
+                }
+            }
+            text
+        })
+        .collect()
 }
 
 fn header(state: &State, cols: usize) -> String {
@@ -602,7 +714,7 @@ fn header(state: &State, cols: usize) -> String {
     };
     let keys = match (state.selected.is_some(), state.input.is_some()) {
         (true, _) => " ── ↑↓ select · Enter open · Esc back",
-        (false, true) if !state.rows.is_empty() => " ── ↑↓ to select",
+        (false, true) if !state.rows.is_empty() => " ── ↓ to select",
         (false, false) if !state.rows.is_empty() => " ── ↓ on an empty prompt to select",
         _ => "",
     };
@@ -640,6 +752,12 @@ fn terminal_size() -> (usize, usize) {
 
 /// Mouse reporting only while a dock row is selected, so the wheel and text selection keep
 /// working on the terminal's scrollback the rest of the time.
+fn show_cursor() {
+    if is_capable() {
+        write_raw("\x1b[?25h");
+    }
+}
+
 fn set_mouse(on: bool) {
     if !is_capable() {
         return;
@@ -692,9 +810,9 @@ mod tests {
             input: Some(InputLine::default()),
             ..State::default()
         };
-        assert_eq!(Layout::of(&state, 40).height(), 8);
-        assert_eq!(Layout::of(&state, 12).height(), 5);
-        assert_eq!(Layout::of(&State::default(), 40).height(), 0);
+        assert_eq!(Layout::of(&state, (80, 40)).height(), 8);
+        assert_eq!(Layout::of(&state, (80, 12)).height(), 5);
+        assert_eq!(Layout::of(&State::default(), (80, 40)).height(), 0);
     }
 
     #[test]
@@ -707,11 +825,12 @@ mod tests {
             ..State::default()
         };
         let frame = frame(&state, 80, 30);
-        assert!(frame.starts_with("\x1b7\x1b[27;1H"));
+        assert!(frame.starts_with("\x1b7\x1b[?25l\x1b[27;1H"));
         assert!(frame.ends_with("\x1b8"));
         assert!(frame.contains("\x1b[30;1H") && !frame.contains("\x1b[26;1H"));
         let plain = console::strip_ansi_codes(&frame).to_string();
-        assert!(plain.contains("Ctrl+Enter sends now") && plain.contains("children · 1 running"));
+        assert!(frame.contains("\x1b[?25l"), "the input line's caret is the only cursor");
+        assert!(plain.contains("Ctrl+Enter interrupts") && plain.contains("children · 1 running"));
     }
 
     #[test]
@@ -787,5 +906,163 @@ mod tests {
         let draft = |dock: &Dock| std::mem::take(&mut dock.shared.state.lock().unwrap().draft);
         assert_eq!(draft(&dock), "half a thought");
         assert_eq!(draft(&dock), "");
+    }
+
+    fn typed(dock: &Dock, text: &str) {
+        for c in text.chars() {
+            dock.type_key(Key::Char(c));
+        }
+    }
+
+    fn queued(dock: &Dock) -> (Vec<String>, Option<String>) {
+        let state = dock.shared.state.lock().unwrap();
+        (state.queued.clone(), state.steering.clone())
+    }
+
+    #[tokio::test]
+    async fn queued_messages_reach_the_turn_one_at_a_time() {
+        let dock = typing();
+        typed(&dock, "first");
+        dock.type_key(Key::Enter);
+        typed(&dock, "second");
+        dock.type_key(Key::Enter);
+
+        assert_eq!(dock.next_steer().as_deref(), Some("first"));
+        assert_eq!(dock.next_steer(), None, "one message on its way at a time");
+        let plain =
+            console::strip_ansi_codes(&input_rows(&dock.shared.state.lock().unwrap(), 80, 1)[0])
+                .to_string();
+        assert!(
+            plain.contains("2 queued"),
+            "the one on its way still counts: {plain}"
+        );
+
+        dock.finish_steer(false);
+        assert_eq!(queued(&dock), (vec!["first".into(), "second".into()], None));
+        assert_eq!(
+            dock.next_steer().as_deref(),
+            Some("first"),
+            "a declined one goes first"
+        );
+        dock.finish_steer(true);
+        assert_eq!(queued(&dock), (vec!["second".into()], None));
+
+        assert_eq!(dock.next_steer().as_deref(), Some("second"));
+        typed(&dock, "third");
+        dock.type_key(Key::Enter);
+        assert_eq!(
+            dock.take_queued().as_deref(),
+            Some("second\n\nthird"),
+            "a turn that ends sends what never arrived"
+        );
+        dock.requeue(vec!["lost".into()]);
+        assert_eq!(dock.take_queued().as_deref(), Some("lost"));
+    }
+
+    #[tokio::test]
+    async fn up_on_an_empty_line_takes_back_the_newest_queued_message() {
+        let dock = typing();
+        assert_eq!(
+            dock.type_key(Key::Up),
+            Typed::Ignored,
+            "nothing queued: the dock's"
+        );
+        typed(&dock, "one");
+        dock.type_key(Key::Enter);
+        typed(&dock, "two");
+        dock.type_key(Key::Enter);
+
+        assert_eq!(dock.type_key(Key::Up), Typed::Edited);
+        assert_eq!(queued(&dock).0, ["one"]);
+        assert_eq!(
+            dock.type_key(Key::Up),
+            Typed::Ignored,
+            "a line being edited keeps it"
+        );
+        typed(&dock, "!");
+        {
+            let state = dock.shared.state.lock().unwrap();
+            let input = state.input.as_ref().unwrap();
+            assert_eq!(input.text.iter().collect::<String>(), "two!");
+            assert_eq!(input.cursor, 4);
+        }
+        assert_eq!(dock.type_key(Key::Enter), Typed::Queued);
+        assert_eq!(queued(&dock).0, ["one", "two!"]);
+
+        assert_eq!(dock.next_steer().as_deref(), Some("one"));
+        dock.type_key(Key::Up);
+        assert_eq!(dock.type_key(Key::Up), Typed::Ignored);
+        assert_eq!(
+            queued(&dock),
+            (vec![], Some("one".into())),
+            "the one on its way stays"
+        );
+    }
+
+    fn input_state(text: &str, cursor: usize, queued: usize) -> State {
+        State {
+            input: Some(InputLine {
+                text: text.chars().collect(),
+                cursor,
+            }),
+            queued: (0..queued).map(|i| i.to_string()).collect(),
+            ..State::default()
+        }
+    }
+
+    fn plain_rows(state: &State, cols: usize, rows: usize) -> Vec<String> {
+        input_rows(state, cols, rows)
+            .iter()
+            .map(|row| console::strip_ansi_codes(row).trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_hint_gives_way_to_the_text() {
+        let short = plain_rows(&input_state("hi", 2, 2), 80, 1);
+        assert!(short[0].starts_with("› hi"), "{short:?}");
+        assert!(
+            short[0].ends_with("2 queued · ↑ edits · Enter sends mid-turn · Ctrl+Enter interrupts")
+        );
+
+        let text = "x".repeat(55);
+        let long = plain_rows(&input_state(&text, 55, 2), 80, 1);
+        assert!(long[0].contains(&text), "the text is never cut: {long:?}");
+        assert!(long[0].ends_with("2 queued · ↑ edits"), "{long:?}");
+
+        let text = "x".repeat(74);
+        let full = plain_rows(&input_state(&text, 74, 2), 80, 1);
+        assert!(
+            full[0].contains(&text) && !full[0].contains("queued"),
+            "{full:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_message_wraps_and_keeps_the_caret_in_view() {
+        let text: String = ('a'..='z').cycle().take(50).collect();
+        let state = input_state(&text, 50, 0);
+        assert_eq!(Layout::of(&state, (20, 40)).input, 3);
+        let rows = plain_rows(&state, 20, 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.concat().replace(['›', ' '], ""), text);
+
+        // Two rows for three lines of text: the caret's line and the one before it show.
+        let rows = plain_rows(&state, 20, 2);
+        assert_eq!(
+            rows,
+            [format!("  {}", &text[18..36]), format!("  {}", &text[36..])]
+        );
+        let rows = plain_rows(&input_state(&text, 0, 0), 20, 2);
+        assert!(
+            rows[0].starts_with(&format!("› {}", &text[..18])),
+            "{rows:?}"
+        );
+
+        // Within a reservation the long message takes rows from the dock, never its header.
+        let mut state = input_state(&text, 50, 0);
+        state.rows = vec![row("a", ChildStatus::Running)];
+        state.reserved = 4;
+        assert_eq!(shown_layout(&state, (20, 40)), Layout { input: 3, list: 1 });
     }
 }

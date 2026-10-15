@@ -419,6 +419,13 @@ pub fn render_message_streaming(
     if !message.is_user_visible() {
         return;
     }
+    // A message typed during the turn and handed to it, shown the way it was typed.
+    if message.metadata.steer && message.role == Role::User {
+        flush_markdown_buffer(buffer, get_theme());
+        outln!("\n{} {}", accent(">"), message.as_concat_text());
+        let _ = std::io::stdout().flush();
+        return;
+    }
     let message = message.user_visible_content();
     let theme = get_theme();
 
