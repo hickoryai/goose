@@ -6,6 +6,7 @@ mod elicitation;
 mod input;
 mod output;
 mod paste;
+mod router_notices;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;

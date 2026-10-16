@@ -7,6 +7,7 @@
 
 use super::child_sessions::{Key, Screen};
 use super::output::{sanitize_terminal_line, tool_call_line, tool_call_summary};
+use super::router_notices::{self, Segment};
 use console::style;
 use goose::conversation::message::{Message, MessageContent};
 use rmcp::model::JsonObject;
@@ -65,20 +66,27 @@ pub struct ToolCall {
     pub output: Vec<String>,
     pub error: Option<String>,
     pub status: CallStatus,
+    /// A router-acp notice from the reply text rather than a tool call; `output` holds its
+    /// full text.
+    pub notice: bool,
 }
 
 pub fn has_tool_calls(messages: &[Message]) -> bool {
     messages.iter().any(|message| {
-        message
-            .content
-            .iter()
-            .any(|content| matches!(content, MessageContent::ToolRequest(_)))
+        message.content.iter().any(|content| match content {
+            MessageContent::ToolRequest(_) => true,
+            MessageContent::Text(text) => router_notices::split(&text.text)
+                .iter()
+                .any(|segment| matches!(segment, Segment::Notice(_))),
+            _ => false,
+        })
     })
 }
 
 /// Every tool call in `messages`, in order, with its response when one arrived.
 pub fn collect(messages: &[Message]) -> Vec<ToolCall> {
     let mut calls: Vec<ToolCall> = Vec::new();
+    let mut notices = 0;
     for content in messages.iter().flat_map(|message| &message.content) {
         match content {
             MessageContent::ToolRequest(request) => {
@@ -99,6 +107,7 @@ pub fn collect(messages: &[Message]) -> Vec<ToolCall> {
                         output: Vec::new(),
                         error: None,
                         status: CallStatus::Running,
+                        notice: false,
                     },
                     Err(error) => ToolCall {
                         id: request.id.clone(),
@@ -109,6 +118,7 @@ pub fn collect(messages: &[Message]) -> Vec<ToolCall> {
                         output: Vec::new(),
                         error: Some(error.message.to_string()),
                         status: CallStatus::Failed,
+                        notice: false,
                     },
                 });
             }
@@ -135,6 +145,24 @@ pub fn collect(messages: &[Message]) -> Vec<ToolCall> {
                     Err(error) => {
                         call.error = Some(error.message.to_string());
                         call.status = CallStatus::Failed;
+                    }
+                }
+            }
+            MessageContent::Text(text) => {
+                for segment in router_notices::split(&text.text) {
+                    if let Segment::Notice(notice) = segment {
+                        notices += 1;
+                        calls.push(ToolCall {
+                            id: format!("router-notice-{notices}"),
+                            name: "router-acp".to_string(),
+                            summary: router_notices::summary(&notice),
+                            kind: Some("router notice".to_string()),
+                            arguments: None,
+                            output: vec![notice],
+                            error: None,
+                            status: CallStatus::Done,
+                            notice: true,
+                        });
                     }
                 }
             }
@@ -196,6 +224,20 @@ fn detail_step(scroll: usize, max_scroll: usize, page: usize, key: Key) -> Detai
 /// Everything about one call, as plain lines before wrapping.
 pub fn detail_lines(call: &ToolCall) -> Vec<String> {
     let mut lines = vec![format!("▸ {}", call.summary), String::new()];
+    if call.notice {
+        lines.push("router-acp notice".to_string());
+        lines.push(String::new());
+        lines.extend(
+            call.output
+                .iter()
+                .flat_map(|text| text.lines())
+                .map(str::to_string),
+        );
+        return lines
+            .into_iter()
+            .map(|line| sanitize_terminal_line(&line))
+            .collect();
+    }
     lines.push(format!("tool     {}", call.name));
     if let Some(kind) = &call.kind {
         lines.push(format!("kind     {kind}"));
@@ -480,6 +522,46 @@ mod tests {
             ),
             Message::assistant().with_tool_request("c", Ok(call("Guardian Review", Value::Null))),
         ]
+    }
+
+    const DELEGATE: &str = r#"router-acp · delegate_task → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · task Feature · planner → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · phase=implementation (pool: implementation_candidates + boost +3.00) · utility 3.63 = 0.84×quality 2.97→0.55 (Feature) + 0.16×quota (headroom 60%, cost rank 4) + pref 3.07 · tradeoff 3→1.6 (complexity-scaled) · "[router-acp planner role: implement-work] Policy identity...""#;
+
+    #[test]
+    fn router_notices_are_listed_with_their_full_text() {
+        let mut messages = conversation();
+        messages.insert(
+            2,
+            Message::assistant().with_text(format!(
+                "Handing this off.\n\n> {DELEGATE}\n> candidates: claude@07460b494a7f4c0b9474e2957345695f/opus[1m]\n\n"
+            )),
+        );
+        let calls = collect(&messages);
+        let summaries: Vec<&str> = calls.iter().map(|call| call.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            [
+                "Terminal",
+                "router-acp · delegate_task Feature · planner → opus",
+                "mcp.router-delegate.planner_workflow",
+                "Guardian Review",
+            ]
+        );
+        assert!(calls[1].notice);
+        let detail = detail_lines(&calls[1]).join("\n");
+        for expected in [
+            "utility 3.63 = 0.84×quality",
+            "claude@07460b494a7f4c0b9474e2957345695f/opus[1m]",
+            "\"[router-acp planner role: implement-work] Policy identity...\"",
+            "candidates: claude@07460b494a7f4c0b9474e2957345695f/opus[1m]",
+        ] {
+            assert!(
+                detail.contains(expected),
+                "missing {expected:?} in\n{detail}"
+            );
+        }
+        assert!(has_tool_calls(&[
+            Message::assistant().with_text(format!("> {DELEGATE}\n"))
+        ]));
     }
 
     #[test]

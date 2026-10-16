@@ -237,7 +237,9 @@ impl Display {
             &mut self.thinking_header_shown,
             self.debug,
         );
-        let text = output::capture_output(|| {
+        // Text after the last line end has not gone out yet: a tool-call line must end it.
+        let line_start = self.partial.is_empty();
+        let text = output::capture_output_after(line_start, || {
             output::render_message_streaming(message, markdown, thinking_header_shown, debug)
         });
         self.emit(text, false);

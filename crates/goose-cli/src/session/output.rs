@@ -30,18 +30,40 @@ pub const DEFAULT_CLI_DARK_THEME: &str = "zenburn";
 const OUTPUT_TOKEN_LIMIT_WARNING: &str =
     "Warning: Response reached the model's output-token limit and may be incomplete.";
 
-thread_local! {
-    static CAPTURED: RefCell<Option<String>> = const { RefCell::new(None) };
+/// Output collected by `capture_output`, and whether the output it continues ended a line.
+struct Capture {
+    text: String,
+    line_start: bool,
 }
+
+thread_local! {
+    static CAPTURED: RefCell<Option<Capture>> = const { RefCell::new(None) };
+}
+
+/// Whether what this module last wrote to stdout ended its line, so a tool-call line can
+/// start on a line of its own after streamed text that did not.
+static LINE_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Runs `render` with everything this module prints collected into a string instead of
 /// written to stdout, so output can be handed to something that owns the terminal (the
 /// line editor's external printer) without disturbing it.
 pub fn capture_output(render: impl FnOnce()) -> String {
-    let outer = CAPTURED.with(|captured| captured.replace(Some(String::new())));
+    capture_output_after(true, render)
+}
+
+/// `capture_output` for output that continues text which `line_start` says ended its line
+/// (or not).
+pub fn capture_output_after(line_start: bool, render: impl FnOnce()) -> String {
+    let outer = CAPTURED.with(|captured| {
+        captured.replace(Some(Capture {
+            text: String::new(),
+            line_start,
+        }))
+    });
     render();
     CAPTURED
         .with(|captured| captured.replace(outer))
+        .map(|capture| capture.text)
         .unwrap_or_default()
 }
 
@@ -49,17 +71,41 @@ fn is_capturing() -> bool {
     CAPTURED.with(|captured| captured.borrow().is_some())
 }
 
+/// Whether `text` ends a line; `None` when it prints nothing visible to tell.
+fn ends_line(text: &str) -> Option<bool> {
+    console::strip_ansi_codes(text)
+        .chars()
+        .last()
+        .map(|last| last == '\n')
+}
+
+/// Whether the next output starts at the beginning of a line.
+fn at_line_start() -> bool {
+    CAPTURED.with(|captured| match captured.borrow().as_ref() {
+        Some(capture) => ends_line(&capture.text).unwrap_or(capture.line_start),
+        None => LINE_START.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+/// Records that `text` went to stdout outside `emit` (bat's printer).
+fn note_written(text: &str) {
+    if let Some(ended) = ends_line(text) {
+        LINE_START.store(ended, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn emit(args: std::fmt::Arguments<'_>) {
-    let unwritten = CAPTURED.with(|captured| match captured.borrow_mut().as_mut() {
-        Some(buffer) => {
-            use std::fmt::Write as _;
-            let _ = buffer.write_fmt(args);
-            None
+    let text = args.to_string();
+    let printed = CAPTURED.with(|captured| match captured.borrow_mut().as_mut() {
+        Some(capture) => {
+            capture.text.push_str(&text);
+            false
         }
-        None => Some(args),
+        None => true,
     });
-    if let Some(args) = unwritten {
-        anstream::print!("{args}");
+    if printed {
+        anstream::print!("{text}");
+        note_written(&text);
     }
 }
 
@@ -364,7 +410,11 @@ pub fn render_message(message: &Message, debug: bool) {
                     outln!("action_required(tool_confirmation_response): {}", id)
                 }
             },
-            MessageContent::Text(text) => print_markdown(&text.text, theme),
+            MessageContent::Text(text) => {
+                let mut buffer = MarkdownBuffer::new();
+                render_reply_text(&text.text, &mut buffer, theme);
+                flush_markdown_buffer(&mut buffer, theme);
+            }
             MessageContent::ToolRequest(req) => render_tool_request(req, theme, debug),
             MessageContent::ToolResponse(resp) => render_tool_response(resp, debug),
             MessageContent::Image(image) => {
@@ -437,11 +487,7 @@ pub fn render_message_streaming(
         }
 
         match content {
-            MessageContent::Text(text) => {
-                if let Some(safe_content) = buffer.push(&text.text) {
-                    print_markdown(&safe_content, theme);
-                }
-            }
+            MessageContent::Text(text) => render_reply_text(&text.text, buffer, theme),
             MessageContent::ToolRequest(req) => {
                 flush_markdown_buffer(buffer, theme);
                 render_tool_request(req, theme, debug);
@@ -718,11 +764,35 @@ pub(super) fn tool_call_line(summary: &str, width: Option<usize>) -> String {
     }
 }
 
+/// One dim line on a line of its own: text streamed without a line end is ended first, so
+/// the call never joins the prose before it (and no blank line is added).
 fn print_tool_call_line(summary: &str) {
+    if !at_line_start() {
+        outln!();
+    }
     let width = std::io::stdout()
         .is_terminal()
         .then(|| Term::stdout().size().1 as usize);
     outln!("{}", style(tool_call_line(summary, width)).dim());
+}
+
+/// Reply text, with each router-acp notice quoted in it shown as a tool-call line.
+fn render_reply_text(text: &str, buffer: &mut MarkdownBuffer, theme: Theme) {
+    for segment in super::router_notices::split(text) {
+        match segment {
+            super::router_notices::Segment::Text(text) => {
+                if let Some(safe_content) = buffer.push(&text) {
+                    print_markdown(&safe_content, theme);
+                }
+            }
+            super::router_notices::Segment::Notice(notice) => {
+                flush_markdown_buffer(buffer, theme);
+                print_tool_call_line(&sanitize_terminal_line(&super::router_notices::summary(
+                    &notice,
+                )));
+            }
+        }
+    }
 }
 
 fn render_tool_response(resp: &ToolResponse, debug: bool) {
@@ -1078,6 +1148,7 @@ fn print_markdown_raw(content: &str, theme: Theme) {
             out!("{rendered}");
         } else {
             printer.print().unwrap();
+            note_written(content);
         }
     });
 }
@@ -1920,6 +1991,64 @@ mod tests {
             Value::Object(map) => call.with_arguments(map),
             _ => call,
         }
+    }
+
+    fn terminal_request(id: &str) -> Message {
+        Message::assistant().with_tool_request(id, Ok(tool_call("Terminal", Value::Null)))
+    }
+
+    fn stream(messages: &[Message]) -> String {
+        let printed = capture_output(|| {
+            let mut buffer = MarkdownBuffer::new();
+            let mut thinking = false;
+            for message in messages {
+                render_message_streaming(message, &mut buffer, &mut thinking, false);
+            }
+            flush_markdown_buffer(&mut buffer, Theme::Dark);
+        });
+        console::strip_ansi_codes(&printed).into_owned()
+    }
+
+    #[test]
+    fn a_tool_call_after_unterminated_prose_starts_its_own_line() {
+        let printed = stream(&[
+            Message::assistant().with_text(
+                "Now retrying the chord-spelling warm-up, which the memory guard deferred.",
+            ),
+            terminal_request("t1"),
+            terminal_request("t2"),
+        ]);
+        assert_eq!(
+            printed,
+            "Now retrying the chord-spelling warm-up, which the memory guard deferred.\n  ▸ Terminal\n  ▸ Terminal\n"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_after_a_finished_line_adds_no_blank_line() {
+        let printed = stream(&[
+            Message::assistant().with_text("Done.\n"),
+            terminal_request("t1"),
+        ]);
+        assert_eq!(printed, "Done.\n  ▸ Terminal\n");
+        // Output that continues text that did not end its line is ended first.
+        let continued = capture_output_after(false, || print_tool_call_line("Edit"));
+        assert_eq!(console::strip_ansi_codes(&continued), "\n  ▸ Edit\n");
+    }
+
+    #[test]
+    fn router_notices_print_as_plain_tool_call_lines() {
+        let notice = r#"router-acp · delegate_task → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · task Feature · planner → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · phase=implementation (pool: implementation_candidates + boost +3.00) · utility 3.63 = 0.84×quality 2.97→0.55 (Feature) + 0.16×quota (headroom 60%, cost rank 4) + pref 3.07 · tradeoff 3→1.6 (complexity-scaled) · "[router-acp planner role: implement-work] Policy identity...""#;
+        let printed = stream(&[
+            terminal_request("t0"),
+            Message::assistant().with_text(format!(
+                "> {notice}\n> **detail** that stays hidden\n\nOn it."
+            )),
+        ]);
+        assert_eq!(
+            printed,
+            "  ▸ Terminal\n  ▸ router-acp · delegate_task Feature · planner → opus\nOn it."
+        );
     }
 
     #[test]
