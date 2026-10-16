@@ -2,7 +2,6 @@ use crate::session::builder::ExtensionFailure;
 use anstream::{adapter::strip_str, eprintln};
 use bat::WrappingMode;
 use console::{measure_text_width, style, Color, StyledObject, Term};
-use goose::agents::platform_extensions::todo::TODO_WRITE_TOOL_NAME_COMPLETE;
 use goose::config::Config;
 use goose::conversation::message::{
     ActionRequiredData, Message, MessageContent, SystemNotificationContent, SystemNotificationType,
@@ -627,23 +626,110 @@ fn render_thinking_streaming(
     }
 }
 
+/// A tool call is one line of the transcript: `▸` and what the call does. Everything else
+/// about it (arguments, output, errors) is in the tool-call detail view (↑ from the prompt),
+/// and its output also prints under it with `/toggle` on.
 fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
     match &req.tool_call {
-        Ok(call) => match call.name.to_string().as_str() {
-            name if is_shell_tool_name(name) => render_shell_request(call, debug),
-            name if is_file_tool_name(name) => render_text_editor_request(call, debug),
-            "execute_typescript" | "execute_code" => render_execute_code_request(call, debug),
-            "delegate" => render_delegate_request(call, debug),
-            "subagent" => render_delegate_request(call, debug),
-            TODO_WRITE_TOOL_NAME_COMPLETE => render_todo_request(call, debug),
-            "load" => {}
-            _ => render_default_request(call, debug),
-        },
+        Ok(call) => {
+            let Some(summary) = tool_call_summary(call, debug) else {
+                return;
+            };
+            print_tool_call_line(&summary);
+            if debug {
+                print_params(&call.arguments, 1, debug);
+            }
+        }
         Err(e) => print_markdown(&e.to_string(), theme),
     }
 }
 
+/// The one line a tool call shows in the transcript (without its `▸`), or `None` for a call
+/// that shows nothing.
+pub(super) fn tool_call_summary(call: &CallToolRequestParams, debug: bool) -> Option<String> {
+    let name = call.name.as_ref();
+    let arg = |key: &str| {
+        call.arguments
+            .as_ref()
+            .and_then(|args| args.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    let with_detail = |label: String, detail: Option<String>| match detail {
+        Some(detail) => format!("{label} {detail}"),
+        None => label,
+    };
+    let summary = match name {
+        "load" => return None,
+        name if is_shell_tool_name(name) => {
+            with_detail(name.to_string(), arg("command").map(first_line))
+        }
+        name if is_file_tool_name(name) => with_detail(
+            name.to_string(),
+            arg("path").map(|path| shorten_path(path, debug)),
+        ),
+        "execute_typescript" | "execute_code" => {
+            let count = call
+                .arguments
+                .as_ref()
+                .and_then(|args| args.get("tool_graph"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            match count {
+                0 => tool_display_name(name),
+                1 => "execute 1 tool call".to_string(),
+                n => format!("execute {n} tool calls"),
+            }
+        }
+        "delegate" | "subagent" => with_detail(
+            name.to_string(),
+            arg("source")
+                .or_else(|| arg("instructions"))
+                .map(first_line),
+        ),
+        _ => tool_display_name(name),
+    };
+    Some(sanitize_terminal_line(&summary))
+}
+
+fn first_line(text: &str) -> String {
+    text.trim().lines().next().unwrap_or_default().to_string()
+}
+
+/// `tool extension` for an extension's tool, else the name (an ACP agent's call title).
+fn tool_display_name(name: &str) -> String {
+    let parts = ToolNameParts::from(name);
+    match parts.extension_name {
+        Some(extension_name) => format!(
+            "{} {}",
+            parts.tool_name,
+            extension_display_name(extension_name)
+        ),
+        None => parts.tool_name.to_string(),
+    }
+}
+
+/// `  ▸ summary`, cut to the terminal's width so it stays one row.
+pub(super) fn tool_call_line(summary: &str, width: Option<usize>) -> String {
+    let line = format!("  ▸ {summary}");
+    match width {
+        Some(width) if width > 1 => console::truncate_str(&line, width - 1, "…").into_owned(),
+        _ => line,
+    }
+}
+
+fn print_tool_call_line(summary: &str) {
+    let width = std::io::stdout()
+        .is_terminal()
+        .then(|| Term::stdout().size().1 as usize);
+    outln!("{}", style(tool_call_line(summary, width)).dim());
+}
+
 fn render_tool_response(resp: &ToolResponse, debug: bool) {
+    // Output stays out of the transcript unless asked for; the detail view has all of it.
+    if !debug && !get_show_full_tool_output() && std::io::stdout().is_terminal() {
+        return;
+    }
     let config = Config::global();
 
     match &resp.tool_result {
@@ -896,164 +982,6 @@ pub fn render_builtin_error(names: &str, error: &str) {
     outln!();
 }
 
-fn render_text_editor_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
-
-    if let Some(args) = &call.arguments {
-        if let Some(Value::String(path)) = args.get("path") {
-            outln!(
-                "    {} {}",
-                style("path").dim(),
-                style(shorten_path(path, debug)).dim()
-            );
-        }
-
-        if let Some(args) = &call.arguments {
-            let mut other_args = serde_json::Map::new();
-            for (k, v) in args {
-                if k != "path" {
-                    other_args.insert(k.clone(), v.clone());
-                }
-            }
-            if !other_args.is_empty() {
-                print_params(&Some(other_args), 1, debug);
-            }
-        }
-    }
-    outln!();
-}
-
-fn render_shell_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
-    print_params(&call.arguments, 1, debug);
-    outln!();
-}
-
-fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
-    let tool_graph = call
-        .arguments
-        .as_ref()
-        .and_then(|args| args.get("tool_graph"))
-        .and_then(Value::as_array)
-        .filter(|arr| !arr.is_empty());
-
-    let Some(tool_graph) = tool_graph else {
-        return render_default_request(call, debug);
-    };
-
-    let count = tool_graph.len();
-    let plural = if count == 1 { "" } else { "s" };
-    outln!();
-    outln!(
-        "  {} {} {} tool call{}",
-        style("▸").dim(),
-        style("execute").dim(),
-        style(count).dim(),
-        plural,
-    );
-
-    for (i, node) in tool_graph.iter().filter_map(Value::as_object).enumerate() {
-        let tool = node
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let desc = node
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let deps: Vec<_> = node
-            .get("depends_on")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_u64)
-            .map(|d| (d + 1).to_string())
-            .collect();
-        let deps_str = if deps.is_empty() {
-            String::new()
-        } else {
-            format!(" (uses {})", deps.join(", "))
-        };
-        outln!(
-            "    {}. {} {}{}",
-            style(i + 1).dim(),
-            style(tool).dim(),
-            style(desc).dim(),
-            style(deps_str).dim()
-        );
-    }
-
-    let code = call
-        .arguments
-        .as_ref()
-        .and_then(|args| args.get("code"))
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty());
-    if code.is_some_and(|_| debug) {
-        outln!("{}", code.unwrap_or_default());
-    }
-
-    outln!();
-}
-
-fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
-
-    if let Some(args) = &call.arguments {
-        if let Some(Value::String(source)) = args.get("source") {
-            outln!("    {} {}", style("source").dim(), style(source).dim());
-        }
-
-        if let Some(Value::String(instructions)) = args.get("instructions") {
-            let display = if instructions.len() > 100 && !debug {
-                safe_truncate(instructions, 100)
-            } else {
-                instructions.clone()
-            };
-            outln!(
-                "    {} {}",
-                style("instructions").dim(),
-                style(display).dim()
-            );
-        }
-
-        if let Some(Value::Object(params)) = args.get("parameters") {
-            outln!("    {}:", style("parameters").dim());
-            print_params(&Some(params.clone()), 2, debug);
-        }
-
-        let skip_keys = ["source", "instructions", "parameters"];
-        let mut other_args = serde_json::Map::new();
-        for (k, v) in args {
-            if !skip_keys.contains(&k.as_str()) {
-                other_args.insert(k.clone(), v.clone());
-            }
-        }
-        if !other_args.is_empty() {
-            print_params(&Some(other_args), 1, debug);
-        }
-    }
-
-    outln!();
-}
-
-fn render_todo_request(call: &CallToolRequestParams, _debug: bool) {
-    print_tool_header(call);
-
-    if let Some(args) = &call.arguments {
-        if let Some(Value::String(content)) = args.get("content") {
-            outln!("    {} {}", style("content").dim(), style(content).dim());
-        }
-    }
-    outln!();
-}
-
-fn render_default_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
-    print_params(&call.arguments, 1, debug);
-    outln!();
-}
-
 fn extension_display_name(name: &str) -> &str {
     match name {
         "code_execution" => "Code Mode",
@@ -1082,91 +1010,21 @@ pub fn render_subagent_tool_call(
     arguments: Option<&JsonObject>,
     debug: bool,
 ) {
+    let mut summary = format_subagent_tool_call_message(subagent_id, tool_name);
     if tool_name == "code_execution__execute_typescript" {
-        let tool_graph = arguments
+        let count = arguments
             .and_then(|args| args.get("tool_graph"))
             .and_then(Value::as_array)
-            .filter(|arr| !arr.is_empty());
-        if let Some(tool_graph) = tool_graph {
-            return render_subagent_tool_graph(subagent_id, tool_graph);
+            .map_or(0, Vec::len);
+        if count > 0 {
+            let plural = if count == 1 { "" } else { "s" };
+            summary = format!("{summary} · {count} tool call{plural}");
         }
     }
-    let tool_header = format!(
-        "  {} {}",
-        style("▸").dim(),
-        style(format_subagent_tool_call_message(subagent_id, tool_name)).dim(),
-    );
-    outln!();
-    outln!("{}", tool_header);
-    print_params(&arguments.cloned(), 1, debug);
-    outln!();
-}
-
-fn render_subagent_tool_graph(subagent_id: &str, tool_graph: &[Value]) {
-    let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
-    let count = tool_graph.len();
-    let plural = if count == 1 { "" } else { "s" };
-    outln!();
-    outln!(
-        "  {} {} {} {} tool call{}",
-        style("▸").dim(),
-        style(format!("[subagent:{}]", short_id)).dim(),
-        style("execute_typescript").dim(),
-        style(count).dim(),
-        plural,
-    );
-
-    for (i, node) in tool_graph.iter().filter_map(Value::as_object).enumerate() {
-        let tool = node
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let desc = node
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let deps: Vec<_> = node
-            .get("depends_on")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_u64)
-            .map(|d| (d + 1).to_string())
-            .collect();
-        let deps_str = if deps.is_empty() {
-            String::new()
-        } else {
-            format!(" (uses {})", deps.join(", "))
-        };
-        outln!(
-            "    {}. {} {}{}",
-            style(i + 1).dim(),
-            style(tool).dim(),
-            style(desc).dim(),
-            style(deps_str).dim()
-        );
+    print_tool_call_line(&sanitize_terminal_line(&summary));
+    if debug {
+        print_params(&arguments.cloned(), 1, debug);
     }
-    outln!();
-}
-
-// Helper functions
-
-fn print_tool_header(call: &CallToolRequestParams) {
-    let parts = ToolNameParts::from(call.name.as_ref());
-    let tool_header = match parts.extension_name {
-        Some(extension_name) => format!(
-            "  {} {} {}",
-            style("▸").dim(),
-            style(parts.tool_name).dim(),
-            style(extension_display_name(extension_name))
-                .magenta()
-                .dim(),
-        ),
-        None => format!("  {} {}", style("▸").dim(), style(parts.tool_name).dim()),
-    };
-    outln!();
-    outln!("  {}", style("─".repeat(40)).dim());
-    outln!("{}", tool_header);
 }
 
 // Respect NO_COLOR, as https://crates.io/crates/console already does
@@ -2054,6 +1912,76 @@ mod tests {
         assert!(!authoritative_tail.contains(PROVIDER_TOKEN));
         assert!(!stderr.contains("\u{1b}]"));
         assert!(!stderr.contains("\u{1b}P"));
+    }
+
+    fn tool_call(name: &str, args: Value) -> CallToolRequestParams {
+        let call = CallToolRequestParams::new(name.to_string());
+        match args {
+            Value::Object(map) => call.with_arguments(map),
+            _ => call,
+        }
+    }
+
+    #[test]
+    fn a_tool_call_is_one_line_without_its_arguments() {
+        let printed = capture_output(|| {
+            render_tool_request(
+                &ToolRequest {
+                    id: "t1".into(),
+                    tool_call: Ok(tool_call(
+                        "Terminal",
+                        serde_json::json!({"command": "cargo test", "cwd": "/repo", "threadId": "x"}),
+                    )),
+                    metadata: None,
+                    tool_meta: None,
+                },
+                Theme::Dark,
+                false,
+            )
+        });
+        assert_eq!(console::strip_ansi_codes(&printed), "  ▸ Terminal\n");
+    }
+
+    #[test]
+    fn tool_call_lines_name_what_the_call_does() {
+        let summary = |name: &str, args: Value| tool_call_summary(&tool_call(name, args), false);
+        assert_eq!(
+            summary("cat .agents/skills/implement-all/SKILL.md", Value::Null).as_deref(),
+            Some("cat .agents/skills/implement-all/SKILL.md")
+        );
+        assert_eq!(
+            summary("shell", serde_json::json!({"command": "ls -la\necho hi"})).as_deref(),
+            Some("shell ls -la")
+        );
+        assert_eq!(
+            summary("developer__shell", Value::Null).as_deref(),
+            Some("shell developer")
+        );
+        assert_eq!(
+            summary(
+                "execute_code",
+                serde_json::json!({"tool_graph": [{"tool": "a"}, {"tool": "b"}]})
+            )
+            .as_deref(),
+            Some("execute 2 tool calls")
+        );
+        assert_eq!(summary("load", Value::Null), None);
+        // Control characters in a title cannot break the line.
+        assert_eq!(
+            summary("Guardian\x1b[2J Review\n", Value::Null).as_deref(),
+            Some("Guardian Review")
+        );
+    }
+
+    #[test]
+    fn tool_call_lines_fit_the_terminal_width() {
+        let line = tool_call_line(
+            "router-delegate__delegate_task mcp with a long tail",
+            Some(20),
+        );
+        assert!(console::measure_text_width(&line) <= 19, "{line:?}");
+        assert!(line.starts_with("  ▸ router"));
+        assert_eq!(tool_call_line("Terminal", None), "  ▸ Terminal");
     }
 
     #[test]

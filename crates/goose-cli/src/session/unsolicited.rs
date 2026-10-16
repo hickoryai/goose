@@ -5,7 +5,6 @@
 
 use super::output;
 use super::streaming_buffer::MarkdownBuffer;
-use console::style;
 use goose::conversation::message::Message;
 use goose::conversation::Conversation;
 use goose::providers::base::{Provider, UnsolicitedUpdate};
@@ -229,20 +228,18 @@ impl Display {
         drained
     }
 
+    /// A burst prints as it would during a turn, with no banner of its own: the dock and the
+    /// child sessions it opens already say which agent is working.
     fn render(&mut self, message: &Message) {
-        let mut text = String::new();
-        if !self.in_burst {
-            self.in_burst = true;
-            text.push_str(&format!("{}\n", style("◆ background turn").dim()));
-        }
+        self.in_burst = true;
         let (markdown, thinking_header_shown, debug) = (
             &mut self.markdown,
             &mut self.thinking_header_shown,
             self.debug,
         );
-        text.push_str(&output::capture_output(|| {
+        let text = output::capture_output(|| {
             output::render_message_streaming(message, markdown, thinking_header_shown, debug)
-        }));
+        });
         self.emit(text, false);
     }
 
