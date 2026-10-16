@@ -9,6 +9,7 @@ mod paste;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
+mod tool_calls;
 mod unsolicited;
 
 use crate::session::task_execution_display::{
@@ -622,6 +623,9 @@ impl CliSession {
         let history_manager = HistoryManager::new();
         history_manager.load(&mut editor);
 
+        // The status line prints once per prompt; coming back from the dock or the tool-call
+        // list returns to the same prompt, so it is not printed again.
+        let mut show_status = true;
         loop {
             if self
                 .extension_loading
@@ -631,7 +635,10 @@ impl CliSession {
                 self.ensure_extensions_loaded(true).await?;
             }
 
-            self.display_context_usage().await?;
+            if show_status {
+                self.display_context_usage().await?;
+            }
+            show_status = true;
             self.sync_unsolicited(Some(&mut editor)).await;
             let queued = self.dock().and_then(|dock| {
                 dock.end_turn();
@@ -665,6 +672,7 @@ impl CliSession {
             }
 
             output::run_status_hook("waiting");
+            tool_calls::set_available(tool_calls::has_tool_calls(self.messages.messages()));
             let input = input::get_input(
                 &mut editor,
                 Some(&conversation_strings),
@@ -672,6 +680,12 @@ impl CliSession {
             )?;
             if matches!(input, InputResult::Exit) {
                 break;
+            }
+            if matches!(input, InputResult::DockFocus | InputResult::ToolFocus) {
+                // The line editor accepted the empty line to hand over the keys; take that
+                // line back so the prompt returns where it was.
+                erase_accepted_prompt_line();
+                show_status = false;
             }
             self.handle_input(input, &history_manager, &mut editor, &conversation_strings)
                 .await?;
@@ -777,6 +791,7 @@ impl CliSession {
                 self.child_navigator(true).await.browse().await;
             }
             InputResult::DockFocus => self.focus_dock().await,
+            InputResult::ToolFocus => self.browse_tool_calls().await,
             InputResult::Edit(prefill) => {
                 history.save(editor);
                 match crate::session::editor::resolve_editor_command() {
@@ -1407,11 +1422,23 @@ impl CliSession {
         let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut steer_retry = tokio::time::interval(STEER_RETRY);
         let mut handed_to_goose: Vec<String> = Vec::new();
+        // ↑ from the input line with nothing queued: the session's tool calls, full screen.
+        let mut tool_view: Option<tool_calls::ToolCallsView> = None;
 
         use futures::StreamExt;
         loop {
             tokio::select! {
                 key = children.next_key() => {
+                    // The tool-call list, while open, takes every key but Ctrl-C.
+                    if let Some(view) = tool_view.as_mut() {
+                        if key == child_sessions::Key::Interrupt {
+                            cancel_token_clone.cancel();
+                        } else if !view.key(key) {
+                            tool_view = None;
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                        }
+                        continue;
+                    }
                     // With the navigator closed, keys drive the footer: arrows, Enter and clicks
                     // the dock; everything else the input line.
                     if !children.is_open() {
@@ -1428,6 +1455,16 @@ impl CliSession {
                                 }
                                 Key::Up if dock.is_selecting() => {
                                     dock.step(-1);
+                                    None
+                                }
+                                // Nothing queued to take back: ↑ moves into the tool calls.
+                                Key::Up if !dock.has_queued() => {
+                                    let calls = tool_calls::collect(self.messages.messages());
+                                    if !calls.is_empty() {
+                                        output::hide_thinking();
+                                        let _ = progress_bars.hide();
+                                        tool_view = tool_calls::ToolCallsView::open(calls);
+                                    }
                                     None
                                 }
                                 Key::Down if dock.has_rows() => {
@@ -1475,7 +1512,7 @@ impl CliSession {
                     let Some(dock) = self.dock() else { continue };
                     let (delivered, echo) = settle_steer(dock, text, outcome, &mut handed_to_goose);
                     if let Some(echo) = &echo {
-                        if children.is_open() {
+                        if children.is_open() || tool_view.is_some() {
                             deferred_messages.push(echo.clone());
                         } else {
                             output::hide_thinking();
@@ -1508,6 +1545,7 @@ impl CliSession {
                                 || output::get_credits_top_up_url(&message).is_some();
                             if needs_terminal {
                                 drop(extended_keys.take());
+                                tool_view = None;
                                 children.suspend();
                                 render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                             }
@@ -1637,6 +1675,9 @@ impl CliSession {
 
                                 if is_stream_json_mode {
                                     emit_stream_event(&StreamEvent::Message { message: message.clone() });
+                                } else if let Some(view) = tool_view.as_mut() {
+                                    view.refresh(tool_calls::collect(self.messages.messages()));
+                                    deferred_messages.push(message);
                                 } else if children.is_open() {
                                     deferred_messages.push(message);
                                 } else if !is_json_mode {
@@ -1653,7 +1694,8 @@ impl CliSession {
                             last_usage = Some(usage);
                         }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}
-                        Some(Ok(AgentEvent::McpNotification(_))) if children.is_open() => {}
+                        Some(Ok(AgentEvent::McpNotification(_)))
+                            if children.is_open() || tool_view.is_some() => {}
                         Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
                             handle_mcp_notification(
                                 &extension_id,
@@ -1669,6 +1711,7 @@ impl CliSession {
                             self.messages = updated_conversation;
                         }
                         Some(Err(e)) => {
+                            tool_view = None;
                             children.suspend();
                             render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                             if interactive || !is_stream_json_mode {
@@ -1693,6 +1736,7 @@ impl CliSession {
                     }
                 }
                 _ = cancel_token_clone.cancelled() => {
+                    tool_view = None;
                     children.suspend();
                     render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                     drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
@@ -1704,6 +1748,7 @@ impl CliSession {
                 }
             }
         }
+        drop(tool_view);
         drop(children);
         if let Some(dock) = self.dock() {
             if dock.is_steering() {
@@ -2318,6 +2363,23 @@ impl CliSession {
         });
     }
 
+    /// ↑ on an empty prompt: the session's tool calls, full screen, until ↓ past the newest,
+    /// Esc or q returns to the prompt.
+    async fn browse_tool_calls(&mut self) {
+        let calls = tool_calls::collect(self.messages.messages());
+        let Ok(mut keys) = child_sessions::KeyReader::start() else {
+            return;
+        };
+        let Some(mut view) = tool_calls::ToolCallsView::open(calls) else {
+            return;
+        };
+        while let Some(key) = keys.next().await {
+            if !view.key(key) {
+                break;
+            }
+        }
+    }
+
     /// ↓ on an empty prompt: ↑/↓ choose a child, Enter (or a click) opens it in the
     /// navigator, Esc or ↑ past the first row returns to the prompt.
     async fn focus_dock(&mut self) {
@@ -2536,6 +2598,15 @@ fn settle_steer(
     };
     dock.finish_steer(settled.0);
     settled
+}
+
+/// Clears the empty `> ` line the line editor left when it handed keys to the dock or the
+/// tool-call list, so returning to the prompt does not stack another one under it.
+fn erase_accepted_prompt_line() {
+    if std::io::stdout().is_terminal() {
+        print!("\x1b[1A\r\x1b[2K");
+        let _ = std::io::stdout().flush();
+    }
 }
 
 fn render_deferred(

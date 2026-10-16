@@ -22,6 +22,8 @@ pub use keys::Key;
 /// Raw key input for a view the session drives itself (the dock's selection).
 pub use terminal::KeyListener as KeyReader;
 pub use terminal::EchoOff;
+/// The alternate screen, for other full-screen views (the tool-call list).
+pub use terminal::Screen;
 use rmcp::model::{ContentBlock, Role};
 use std::sync::Arc;
 use std::time::Duration;
