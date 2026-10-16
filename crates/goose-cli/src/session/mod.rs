@@ -2108,9 +2108,13 @@ impl CliSession {
 
         match self.get_session().await {
             Ok(metadata) => {
-                let total_tokens = metadata.usage.total_tokens.unwrap_or(0) as usize;
-
-                output::display_context_usage(total_tokens, context_limit);
+                if let Some(used) = context_in_use(
+                    provider.context_tokens(),
+                    provider.manages_own_context(),
+                    metadata.usage.total_tokens,
+                ) {
+                    output::display_context_usage(used, context_limit);
+                }
 
                 if show_cost {
                     output::display_cost_usage(
@@ -2121,7 +2125,13 @@ impl CliSession {
                 }
             }
             Err(_) => {
-                output::display_context_usage(0, context_limit);
+                if let Some(used) = context_in_use(
+                    provider.context_tokens(),
+                    provider.manages_own_context(),
+                    Some(0),
+                ) {
+                    output::display_context_usage(used, context_limit);
+                }
             }
         }
 
@@ -3132,6 +3142,21 @@ fn headless_run_error(
         })
 }
 
+/// Tokens the context holds now. A provider that manages its own context reports this itself
+/// (ACP `usage_update.used`); its turn usage sums every model call of the turn, so it is never
+/// shown as context. For goose's own loop the last call's usage is the context.
+fn context_in_use(
+    reported: Option<usize>,
+    manages_own_context: bool,
+    last_call_total: Option<i32>,
+) -> Option<usize> {
+    match reported {
+        Some(used) => Some(used),
+        None if manages_own_context => None,
+        None => Some(last_call_total.unwrap_or(0).max(0) as usize),
+    }
+}
+
 /// Format elapsed time duration
 /// Shows seconds if less than 60, otherwise shows minutes:seconds
 fn format_elapsed_time(duration: std::time::Duration) -> String {
@@ -3171,6 +3196,20 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use test_case::test_case;
+
+    #[test]
+    fn context_usage_prefers_the_providers_report_over_turn_totals() {
+        // router-acp: 3.3M summed over the turn's model calls, 84k actually in context.
+        assert_eq!(
+            context_in_use(Some(84_000), true, Some(3_300_000)),
+            Some(84_000)
+        );
+        // No report yet from a self-managing provider: the turn total is not context.
+        assert_eq!(context_in_use(None, true, Some(3_300_000)), None);
+        // goose's own loop: the last call's usage is the context.
+        assert_eq!(context_in_use(None, false, Some(12_000)), Some(12_000));
+        assert_eq!(context_in_use(None, false, None), Some(0));
+    }
 
     #[test]
     fn only_headless_terminal_failures_are_propagated() {

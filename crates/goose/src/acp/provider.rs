@@ -429,6 +429,9 @@ pub struct AcpProvider {
     /// Latest `size` reported by the ACP server in a `session/update` →
     /// `usage_update` notification. 0 means no real update has arrived yet.
     context_size: Arc<AtomicU64>,
+    /// Latest `used` (tokens currently in the agent's context) from the same notification,
+    /// stored plus one so that 0 means no report has arrived yet.
+    context_used: Arc<AtomicU64>,
 
     /// Config option id used to select the model, if this agent supports it.
     model_config_option_id: Option<String>,
@@ -549,6 +552,7 @@ impl AcpProvider {
         let pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let context_size = Arc::new(AtomicU64::new(0));
+        let context_used = Arc::new(AtomicU64::new(0));
         let effort = AcpEffortState::new();
         let connection = SharedConnection::default();
         let (unsolicited_tx, unsolicited_rx) = mpsc::unbounded_channel();
@@ -559,6 +563,7 @@ impl AcpProvider {
             goose_mode_shared.clone(),
             pending_tool_updates.clone(),
             context_size.clone(),
+            context_used.clone(),
             effort.clone(),
             unsolicited_tx.clone(),
             connection.clone(),
@@ -604,6 +609,7 @@ impl AcpProvider {
             pending_tool_updates,
             handoff_context_sent: Arc::new(AtomicBool::new(false)),
             context_size,
+            context_used,
             model_config_option_id,
             applied_model: Arc::new(Mutex::new(applied_model)),
             effort,
@@ -1002,6 +1008,11 @@ impl Provider for AcpProvider {
         true
     }
 
+    fn context_tokens(&self) -> Option<usize> {
+        let stored = self.context_used.load(Ordering::Relaxed);
+        stored.checked_sub(1).map(|used| used as usize)
+    }
+
     async fn handle_permission_confirmation(
         &self,
         request_id: &str,
@@ -1284,17 +1295,20 @@ struct AcpClientLoop {
     prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     context_size: Arc<AtomicU64>,
+    context_used: Arc<AtomicU64>,
     effort: AcpEffortState,
     unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
     connection: SharedConnection,
 }
 
 impl AcpClientLoop {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: AcpProviderConfig,
         goose_mode: Arc<Mutex<GooseMode>>,
         pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
         context_size: Arc<AtomicU64>,
+        context_used: Arc<AtomicU64>,
         effort: AcpEffortState,
         unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
         connection: SharedConnection,
@@ -1305,6 +1319,7 @@ impl AcpClientLoop {
             prompt_response_tx: Arc::new(Mutex::new(None)),
             pending_tool_updates,
             context_size,
+            context_used,
             effort,
             unsolicited_tx,
             connection,
@@ -1362,6 +1377,7 @@ impl AcpClientLoop {
             prompt_response_tx,
             pending_tool_updates,
             context_size,
+            context_used,
             effort,
             unsolicited_tx,
             connection,
@@ -1379,6 +1395,7 @@ impl AcpClientLoop {
                     let goose_mode = goose_mode.clone();
                     let pending_tool_updates = pending_tool_updates.clone();
                     let context_size = context_size.clone();
+                    let context_used = context_used.clone();
                     let session_state = session_state.clone();
                     let unsolicited_tx = unsolicited_tx.clone();
                     async move |notification: SessionNotification, _cx| {
@@ -1426,6 +1443,7 @@ impl AcpClientLoop {
                             }
                             SessionUpdate::UsageUpdate(usage) => {
                                 context_size.store(usage.size, Ordering::Relaxed);
+                                context_used.store(usage.used.saturating_add(1), Ordering::Relaxed);
                             }
                             _ => {}
                         }
@@ -2705,6 +2723,7 @@ mod tests {
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
                 handoff_context_sent: Arc::new(AtomicBool::new(false)),
                 context_size: Arc::new(AtomicU64::new(0)),
+                context_used: Arc::new(AtomicU64::new(0)),
                 model_config_option_id: None,
                 applied_model: Arc::new(Mutex::new(None)),
                 effort: AcpEffortState::new(),
@@ -3089,6 +3108,16 @@ mod tests {
             provider.get_context_limit(&model.model_name, None).await,
             200_000
         );
+    }
+
+    #[tokio::test]
+    async fn context_tokens_report_the_latest_usage_update_only() {
+        let (provider, _) = test_provider();
+        assert_eq!(provider.context_tokens(), None);
+        provider.context_used.store(1, Ordering::Relaxed);
+        assert_eq!(provider.context_tokens(), Some(0));
+        provider.context_used.store(84_001, Ordering::Relaxed);
+        assert_eq!(provider.context_tokens(), Some(84_000));
     }
 
     #[tokio::test]

@@ -710,6 +710,13 @@ pub trait Provider: MaybeSend + MaybeSync {
         false
     }
 
+    /// Tokens the provider's own agent reports holding in its context right now, for a
+    /// provider that manages its own context. Its per-turn `Usage` sums every model call in
+    /// the turn and so says nothing about how full the context is. `None` until reported.
+    fn context_tokens(&self) -> Option<usize> {
+        None
+    }
+
     fn uses_local_session_naming(&self) -> bool {
         self.manages_own_context()
     }
