@@ -7,6 +7,7 @@ mod input;
 mod output;
 mod paste;
 mod router_notices;
+mod shutdown;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
@@ -263,6 +264,9 @@ pub struct CliSession {
     unsolicited: Option<unsolicited::UnsolicitedRelay>,
     /// The persistent child list under the prompt, and the router session it follows.
     dock: Option<(Option<String>, child_sessions::dock::Dock)>,
+    /// A `/shutdown` router-acp accepted: draining, or done.
+    /// (Behind a lock so a running turn, which holds the agent's stream, can start one.)
+    shutdown: std::sync::Mutex<Option<shutdown::Run>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +353,7 @@ impl CliSession {
             loading_announced: false,
             unsolicited: None,
             dock: None,
+            shutdown: std::sync::Mutex::new(None),
         }
     }
 
@@ -641,6 +646,16 @@ impl CliSession {
             }
             show_status = true;
             self.sync_unsolicited(Some(&mut editor)).await;
+            // A `/shutdown` still draining holds the prompt back until it ends.
+            if self.shutdown_gate() == shutdown::Gate::Draining {
+                if let Some(dock) = self.dock() {
+                    dock.end_turn();
+                }
+                if self.wait_for_shutdown().await {
+                    break;
+                }
+                continue;
+            }
             let queued = self.dock().and_then(|dock| {
                 dock.end_turn();
                 dock.take_queued()
@@ -680,6 +695,9 @@ impl CliSession {
                 self.unsolicited.as_ref(),
             )?;
             if matches!(input, InputResult::Exit) {
+                if self.shutdown_gate() == shutdown::Gate::Draining {
+                    output::print_status_line(shutdown::EXIT_WARNING);
+                }
                 break;
             }
             if matches!(input, InputResult::DockFocus | InputResult::ToolFocus) {
@@ -725,9 +743,15 @@ impl CliSession {
         // here until background extension loading has finished.
         self.ensure_extensions_loaded(true).await?;
         match input {
+            InputResult::Message(_) if self.shutdown_gate() != shutdown::Gate::Open => {
+                if let Some(notice) = self.shutdown_gate().notice() {
+                    output::print_status_line(notice);
+                }
+            }
             InputResult::Message(content) => {
                 self.handle_message_input(&content, history, editor).await?;
             }
+            InputResult::Shutdown => self.start_shutdown().await,
             InputResult::Exit => unreachable!("Exit is handled in the main loop"),
             InputResult::AddExtension(cmd) => {
                 history.save(editor);
@@ -1425,6 +1449,9 @@ impl CliSession {
         let mut handed_to_goose: Vec<String> = Vec::new();
         // ↑ from the input line with nothing queued: the session's tool calls, full screen.
         let mut tool_view: Option<tool_calls::ToolCallsView> = None;
+        // A `/shutdown`'s progress, and its lines held while a full-screen view is open.
+        let mut shutdown_rx = self.take_shutdown_notifications();
+        let mut held_status: Vec<String> = Vec::new();
 
         use futures::StreamExt;
         loop {
@@ -1436,9 +1463,38 @@ impl CliSession {
                             cancel_token_clone.cancel();
                         } else if !view.key(key) {
                             tool_view = None;
+                            print_held_status(&mut held_status);
                             render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                         }
                         continue;
+                    }
+                    // Enter on the input line: `/shutdown` goes to router-acp rather than the
+                    // queue, and nothing else is sent while a shutdown is under way.
+                    let typed = (!children.is_open()
+                        && matches!(key, child_sessions::Key::Enter | child_sessions::Key::SendNow))
+                    .then(|| self.dock().filter(|dock| !dock.is_selecting()).map(|dock| dock.input_text()))
+                    .flatten()
+                    .filter(|text| !text.trim().is_empty());
+                    if let Some(text) = typed {
+                        let gate = self.shutdown_gate();
+                        if text.trim() == "/shutdown" || gate != shutdown::Gate::Open {
+                            output::hide_thinking();
+                            let _ = progress_bars.hide();
+                            match gate.notice() {
+                                // The text stays in the input line.
+                                Some(notice) => output::print_status_line(notice),
+                                None => {
+                                    if let Some(dock) = self.dock() {
+                                        dock.clear_input();
+                                    }
+                                    self.start_shutdown().await;
+                                    if shutdown_rx.is_none() {
+                                        shutdown_rx = self.take_shutdown_notifications();
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                     }
                     // With the navigator closed, keys drive the footer: arrows, Enter and clicks
                     // the dock; everything else the input line.
@@ -1506,7 +1562,19 @@ impl CliSession {
                     }
                     children.handle_key(key, true).await;
                     if was_open && !children.is_open() {
+                        print_held_status(&mut held_status);
                         render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                    }
+                }
+                notification = shutdown::next_notification(&mut shutdown_rx) => {
+                    let lines = self.take_shutdown_progress(&notification);
+                    if children.is_open() || tool_view.is_some() {
+                        held_status.extend(lines);
+                    } else if !lines.is_empty() {
+                        output::hide_thinking();
+                        let _ = progress_bars.hide();
+                        held_status.extend(lines);
+                        print_held_status(&mut held_status);
                     }
                 }
                 Some((text, outcome)) = steer_rx.recv() => {
@@ -1751,6 +1819,8 @@ impl CliSession {
         }
         drop(tool_view);
         drop(children);
+        print_held_status(&mut held_status);
+        self.return_shutdown_notifications(shutdown_rx);
         if let Some(dock) = self.dock() {
             if dock.is_steering() {
                 match tokio::time::timeout(STEER_SETTLE, steer_rx.recv()).await {
@@ -2381,6 +2451,139 @@ impl CliSession {
         }
     }
 
+    fn shutdown_gate(&self) -> shutdown::Gate {
+        shutdown::Gate::of(self.shutdown.lock().unwrap().as_ref())
+    }
+
+    fn take_shutdown_notifications(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<goose::providers::base::ExtensionNotification>>
+    {
+        self.shutdown
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|run| run.notifications.take())
+    }
+
+    fn return_shutdown_notifications(
+        &self,
+        notifications: Option<
+            tokio::sync::broadcast::Receiver<goose::providers::base::ExtensionNotification>,
+        >,
+    ) {
+        if let Some(run) = self.shutdown.lock().unwrap().as_mut() {
+            if run.notifications.is_none() {
+                run.notifications = notifications;
+            }
+        }
+    }
+
+    /// `/shutdown`: router-acp saves the planner run's resume state and drains its workers.
+    /// Refused here outside an `/implement` (planner) session; router-acp may refuse too.
+    async fn start_shutdown(&self) {
+        if let Some(notice) = self.shutdown_gate().notice() {
+            output::print_status_line(notice);
+            return;
+        }
+        if self.router_session_id().await.is_none()
+            || !shutdown::is_planner_session(self.messages.messages())
+        {
+            output::print_status_line(shutdown::REFUSED);
+            return;
+        }
+        let provider = match self.agent.provider(&self.session_id).await {
+            Ok(provider) => provider,
+            Err(error) => {
+                output::print_status_line(&format!("◼ shutdown · refused: {error}"));
+                return;
+            }
+        };
+        let Some(session_id) = provider.provider_session_id() else {
+            output::print_status_line(shutdown::REFUSED);
+            return;
+        };
+        match shutdown::request(provider.as_ref()).await {
+            Ok(notifications) => {
+                *self.shutdown.lock().unwrap() = Some(shutdown::Run {
+                    session_id,
+                    notifications,
+                    drained: false,
+                });
+                if let Some(dock) = self.dock() {
+                    dock.set_status(Some("shutting down".to_string()));
+                }
+            }
+            Err(error) => output::print_status_line(&format!("◼ shutdown · refused: {error}")),
+        }
+    }
+
+    /// Applies one progress notification of the running shutdown, returning the lines to
+    /// print for it (none for another session's or another kind of notification).
+    fn take_shutdown_progress(
+        &self,
+        notification: &goose::providers::base::ExtensionNotification,
+    ) -> Vec<String> {
+        let (progress, lines) = {
+            let mut guard = self.shutdown.lock().unwrap();
+            let Some(run) = guard.as_mut() else {
+                return Vec::new();
+            };
+            let Some(progress) = shutdown::parse(notification, &run.session_id) else {
+                return Vec::new();
+            };
+            let mut lines = vec![shutdown::line(&progress)];
+            match progress.phase {
+                shutdown::Phase::Drained => {
+                    run.drained = true;
+                    lines.push(shutdown::CLOSE_HINT.to_string());
+                }
+                shutdown::Phase::Failed => *guard = None,
+                _ => {}
+            }
+            (progress, lines)
+        };
+        if let Some(dock) = self.dock() {
+            dock.set_status(shutdown::footer(&progress));
+        }
+        lines
+    }
+
+    /// Between turns while the workers drain: no prompt, the progress as it comes, Enter says
+    /// why, and Ctrl-C twice quits. True when the operator quit.
+    async fn wait_for_shutdown(&self) -> bool {
+        let mut notifications = self.take_shutdown_notifications();
+        let mut keys = child_sessions::KeyReader::start().ok();
+        let mut quit = shutdown::QuitGuard::default();
+        output::print_status_line(shutdown::BLOCKED);
+        let quitting = loop {
+            tokio::select! {
+                notification = shutdown::next_notification(&mut notifications) => {
+                    for line in self.take_shutdown_progress(&notification) {
+                        output::print_status_line(&line);
+                    }
+                    if self.shutdown_gate() != shutdown::Gate::Draining {
+                        break false;
+                    }
+                }
+                key = next_key(&mut keys) => {
+                    if matches!(key, child_sessions::Key::Enter | child_sessions::Key::SendNow) {
+                        output::print_status_line(shutdown::BLOCKED);
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => match quit.press() {
+                    shutdown::QuitStep::Confirm => output::print_status_line(shutdown::QUIT_CONFIRM),
+                    shutdown::QuitStep::Quit => {
+                        output::print_status_line(shutdown::EXIT_WARNING);
+                        break true;
+                    }
+                },
+            }
+        };
+        self.return_shutdown_notifications(notifications);
+        quitting
+    }
+
     /// ↓ on an empty prompt: ↑/↓ choose a child, Enter (or a click) opens it in the
     /// navigator, Esc or ↑ past the first row returns to the prompt.
     async fn focus_dock(&mut self) {
@@ -2599,6 +2802,25 @@ fn settle_steer(
     };
     dock.finish_steer(settled.0);
     settled
+}
+
+fn print_held_status(lines: &mut Vec<String>) {
+    for line in lines.drain(..) {
+        output::print_status_line(&line);
+    }
+}
+
+/// The next key from `keys`, or never without a reader.
+async fn next_key(keys: &mut Option<child_sessions::KeyReader>) -> child_sessions::Key {
+    loop {
+        match keys.as_mut() {
+            Some(reader) => match reader.next().await {
+                Some(key) => return key,
+                None => *keys = None,
+            },
+            None => std::future::pending::<()>().await,
+        }
+    }
 }
 
 /// Clears the empty `> ` line the line editor left when it handed keys to the dock or the

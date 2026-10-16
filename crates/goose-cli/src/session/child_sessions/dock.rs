@@ -75,6 +75,8 @@ struct State {
     suspended: bool,
     focus_requested: bool,
     turn_active: bool,
+    /// A session-wide state the header leads with, e.g. `shutting down 1/3`.
+    status: Option<String>,
 }
 
 struct Shared {
@@ -259,6 +261,29 @@ impl Dock {
         };
         self.shared.paint();
         typed
+    }
+
+    /// What the header leads with until cleared with `None`.
+    pub fn set_status(&self, status: Option<String>) {
+        self.shared.state.lock().unwrap().status = status;
+        self.shared.paint();
+    }
+
+    /// The text typed into the turn's input line so far.
+    pub fn input_text(&self) -> String {
+        let state = self.shared.state.lock().unwrap();
+        state
+            .input
+            .as_ref()
+            .map(|input| input.text.iter().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn clear_input(&self) {
+        if let Some(input) = self.shared.state.lock().unwrap().input.as_mut() {
+            *input = InputLine::default();
+        }
+        self.shared.paint();
     }
 
     pub fn has_rows(&self) -> bool {
@@ -728,7 +753,12 @@ fn header(state: &State, cols: usize) -> String {
         (false, false) if !state.rows.is_empty() => " ── ↓ on an empty prompt to select",
         _ => "",
     };
-    let text = format!("── children · {summary}{keys} ");
+    let lead = state
+        .status
+        .as_ref()
+        .map(|status| format!("── {status} "))
+        .unwrap_or_default();
+    let text = format!("{lead}── children · {summary}{keys} ");
     let width = console::measure_text_width(&text);
     let line = format!("{text}{}", "─".repeat(cols.saturating_sub(width)));
     style(console::truncate_str(&line, cols, "").into_owned())

@@ -39,7 +39,8 @@ use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_D
 use crate::permission::permission_confirmation::PrincipalType;
 use crate::permission::{Permission, PermissionConfirmation};
 use crate::providers::base::{
-    MessageStream, PermissionRouting, Provider, SteerOutcome, UnsolicitedUpdate,
+    ExtensionNotification, MessageStream, PermissionRouting, Provider, SteerOutcome,
+    UnsolicitedUpdate,
 };
 use crate::subprocess::configure_subprocess;
 use crate::token_counter::create_token_counter;
@@ -451,6 +452,8 @@ pub struct AcpProvider {
     /// the session by itself after goose's turn ended.
     unsolicited: broadcast::Sender<UnsolicitedUpdate>,
     unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
+    /// Notifications the agent sends under extension methods (`_router/…`).
+    extension_notifications: broadcast::Sender<ExtensionNotification>,
 
     /// The live connection, for requests that must not wait behind a prompt in flight.
     connection: SharedConnection,
@@ -558,6 +561,7 @@ impl AcpProvider {
         let (unsolicited_tx, unsolicited_rx) = mpsc::unbounded_channel();
         let (unsolicited, _) = broadcast::channel(UNSOLICITED_CAPACITY);
         tokio::spawn(relay_unsolicited(unsolicited_rx, unsolicited.clone()));
+        let (extension_notifications, _) = broadcast::channel(UNSOLICITED_CAPACITY);
         let client_loop = AcpClientLoop::new(
             config,
             goose_mode_shared.clone(),
@@ -567,6 +571,7 @@ impl AcpProvider {
             effort.clone(),
             unsolicited_tx.clone(),
             connection.clone(),
+            extension_notifications.clone(),
         );
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx, cancel_rx));
@@ -615,6 +620,7 @@ impl AcpProvider {
             effort,
             unsolicited,
             unsolicited_tx,
+            extension_notifications,
             connection,
             steering_unsupported: AtomicBool::new(false),
             tx: client_loop_guard.tx.take(),
@@ -927,6 +933,40 @@ impl Provider for AcpProvider {
 
     fn subscribe_unsolicited(&self) -> Option<broadcast::Receiver<UnsolicitedUpdate>> {
         Some(self.unsolicited.subscribe())
+    }
+
+    fn subscribe_extension_notifications(
+        &self,
+    ) -> Option<broadcast::Receiver<ExtensionNotification>> {
+        Some(self.extension_notifications.subscribe())
+    }
+
+    /// Straight onto the connection, like `steer`: a prompt may be in flight.
+    async fn extension_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let Some(cx) = self.connection.lock().unwrap().clone() else {
+            return Err(ProviderError::RequestFailed(
+                "the agent is not connected".to_string(),
+            ));
+        };
+        let mut params = match params {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        params.insert(
+            "sessionId".to_string(),
+            serde_json::Value::String(self.acp_session_id().0.to_string()),
+        );
+        let request =
+            agent_client_protocol::UntypedMessage::new(method, serde_json::Value::Object(params))
+                .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
+        cx.send_request(request)
+            .block_task()
+            .await
+            .map_err(provider_error_from_acp)
     }
 
     /// `_session/steering` on the active session. It goes straight onto the connection: the
@@ -1299,6 +1339,7 @@ struct AcpClientLoop {
     effort: AcpEffortState,
     unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
     connection: SharedConnection,
+    extension_notifications: broadcast::Sender<ExtensionNotification>,
 }
 
 impl AcpClientLoop {
@@ -1312,6 +1353,7 @@ impl AcpClientLoop {
         effort: AcpEffortState,
         unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
         connection: SharedConnection,
+        extension_notifications: broadcast::Sender<ExtensionNotification>,
     ) -> Self {
         Self {
             config,
@@ -1323,6 +1365,7 @@ impl AcpClientLoop {
             effort,
             unsolicited_tx,
             connection,
+            extension_notifications,
         }
     }
 
@@ -1381,6 +1424,7 @@ impl AcpClientLoop {
             effort,
             unsolicited_tx,
             connection,
+            extension_notifications,
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
@@ -1570,6 +1614,21 @@ impl AcpClientLoop {
                                 }
                                 _ => {}
                             }
+                        }
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            // Extension notifications (`_router/…`) go to whoever subscribed to them.
+            .on_receive_notification(
+                {
+                    let extension_notifications = extension_notifications.clone();
+                    async move |notification: agent_client_protocol::UntypedMessage, _cx| {
+                        let (method, params) = notification.into_parts();
+                        if method.starts_with('_') {
+                            let _ = extension_notifications
+                                .send(ExtensionNotification { method, params });
                         }
                         Ok(())
                     }
@@ -2729,6 +2788,7 @@ mod tests {
                 effort: AcpEffortState::new(),
                 unsolicited: broadcast::channel(1).0,
                 unsolicited_tx: mpsc::unbounded_channel().0,
+                extension_notifications: broadcast::channel(1).0,
                 connection: SharedConnection::default(),
                 steering_unsupported: AtomicBool::new(false),
                 tx,
@@ -5181,5 +5241,98 @@ mod tests {
             SteerOutcome::Unsupported
         );
         assert!(provider.steering_unsupported.load(Ordering::Acquire));
+    }
+
+    /// An extension request carries the session id and returns the agent's answer; the
+    /// extension notifications the agent sends reach subscribers.
+    #[tokio::test]
+    async fn extension_requests_and_notifications_round_trip() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+        };
+        use agent_client_protocol::{
+            on_receive_request, Agent as ScriptedAgent, ByteStreams, UntypedMessage,
+        };
+
+        let (client_read, agent_write) = tokio::io::duplex(64 * 1024);
+        let (agent_read, client_write) = tokio::io::duplex(64 * 1024);
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let agent_requested = requested.clone();
+        tokio::spawn(async move {
+            ScriptedAgent
+                .builder()
+                .on_receive_request(
+                    async |_req: InitializeRequest, responder, _cx| {
+                        responder.respond(
+                            InitializeResponse::new(ProtocolVersion::LATEST)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async |_req: NewSessionRequest, responder, _cx| {
+                        responder.respond(NewSessionResponse::new(SessionId::new("planner-1")))
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: UntypedMessage, responder, cx| {
+                        agent_requested
+                            .lock()
+                            .unwrap()
+                            .push((req.method().to_string(), req.params().clone()));
+                        if req.params()["sessionId"] != "planner-1" {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("session is not in planner mode"),
+                            );
+                        }
+                        cx.send_notification(
+                            UntypedMessage::new(
+                                "_router/shutdown_progress",
+                                serde_json::json!({"sessionId": "planner-1", "phase": "saving"}),
+                            )
+                            .unwrap(),
+                        )?;
+                        responder.respond(serde_json::json!({"accepted": true}))
+                    },
+                    on_receive_request!(),
+                )
+                .connect_to(ByteStreams::new(
+                    agent_write.compat_write(),
+                    agent_read.compat(),
+                ))
+                .await
+        });
+        let provider = AcpProvider::connect_with_transport(
+            "router-acp".to_string(),
+            GooseMode::Auto,
+            test_acp_config(HashMap::new(), None),
+            ByteStreams::new(client_write.compat_write(), client_read.compat()),
+        )
+        .await
+        .unwrap();
+        let mut notifications = provider.subscribe_extension_notifications().unwrap();
+
+        let answer = provider
+            .extension_request("_router/planner_shutdown", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(answer, serde_json::json!({"accepted": true}));
+        assert_eq!(
+            requested.lock().unwrap().clone(),
+            [(
+                "_router/planner_shutdown".to_string(),
+                serde_json::json!({"sessionId": "planner-1"})
+            )]
+        );
+        let notification =
+            tokio::time::timeout(std::time::Duration::from_secs(5), notifications.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(notification.method, "_router/shutdown_progress");
+        assert_eq!(notification.params["phase"], "saving");
     }
 }

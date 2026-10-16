@@ -525,6 +525,14 @@ pub enum UnsolicitedUpdate {
     Settled,
 }
 
+/// A notification the provider's agent sent under an extension method (an ACP method name
+/// starting with `_`, e.g. router-acp's `_router/shutdown_progress`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtensionNotification {
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
 /// What became of user guidance handed to a provider's running turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerOutcome {
@@ -769,6 +777,27 @@ pub trait Provider: MaybeSend + MaybeSync {
     /// agent only ever speaks when prompted return `None`.
     fn subscribe_unsolicited(&self) -> Option<broadcast::Receiver<UnsolicitedUpdate>> {
         None
+    }
+
+    /// Subscribe to the extension notifications the provider's agent sends. Providers whose
+    /// agent has none return `None`.
+    fn subscribe_extension_notifications(
+        &self,
+    ) -> Option<broadcast::Receiver<ExtensionNotification>> {
+        None
+    }
+
+    /// Send an extension request (`_vendor/method`) about the active session to the
+    /// provider's agent and return its answer. `sessionId` is added to `params`.
+    async fn extension_request(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        Err(ProviderError::NotImplemented(format!(
+            "{} does not take {method}",
+            self.get_name()
+        )))
     }
 
     /// Hand user guidance to the turn the provider's own agent is running, without

@@ -29,6 +29,8 @@ pub enum InputResult {
     New,
     Compact,
     Children,
+    /// `/shutdown`: save an `/implement` run's resume state and drain its workers.
+    Shutdown,
     /// ↓ on an empty prompt: move into the child dock.
     DockFocus,
     /// ↑ on an empty prompt: move into the session's tool calls.
@@ -522,6 +524,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_NEW => Some(InputResult::New),
         s if s == CMD_COMPACT => Some(InputResult::Compact),
         s if s == CMD_CHILDREN => Some(InputResult::Children),
+        "/shutdown" => Some(InputResult::Shutdown),
         // Match "/skills" exactly or "/skills " with args - avoids matching e.g. "/skillsextra"
         s if s == CMD_SKILLS || s.starts_with(&format!("{CMD_SKILLS} ")) => {
             let args = s.get(CMD_SKILLS.len()..).unwrap_or("").trim();
@@ -638,6 +641,8 @@ fn help_text() -> String {
 /clear - Clears the current chat history
 /new - Start a fresh session in this process, keeping the current provider, model and extensions
 /children - Browse this session's subagent sessions (read-only)
+/shutdown - In an /implement session: save the run's resume state, drain its workers, and end
+            the session gracefully; /implement in a new session resumes (also mid-turn)
 
 Navigation:
 Enter or Ctrl+Enter - Send message (during a turn: Enter queues it, Ctrl+Enter interrupts and sends)
@@ -698,6 +703,19 @@ mod tests {
 
     fn feed_tail(tail: &mut EscapeTail, text: &str, at: std::time::Instant) -> Vec<TailStep> {
         text.chars().map(|c| tail.step(c, at)).collect()
+    }
+
+    #[test]
+    fn shutdown_is_a_command() {
+        assert!(matches!(
+            handle_slash_command("/shutdown"),
+            Some(InputResult::Shutdown)
+        ));
+        assert!(matches!(
+            handle_slash_command("  /shutdown  "),
+            Some(InputResult::Shutdown)
+        ));
+        assert!(help_text().contains("/shutdown"));
     }
 
     #[test]

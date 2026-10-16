@@ -75,7 +75,9 @@ fn push_prose(segments: &mut Vec<Segment>, prose: &mut String) {
     if trimmed.is_empty() {
         return;
     }
-    let ended = trimmed.len() < text.len() && text[trimmed.len()..].contains('\n');
+    let ended = text
+        .get(trimmed.len()..)
+        .is_some_and(|rest| rest.contains('\n'));
     segments.push(Segment::Text(if ended {
         format!("{trimmed}\n")
     } else {
@@ -276,7 +278,7 @@ pub fn shorten_ids(text: &str) -> String {
     text.split(' ')
         .map(|word| {
             let core = word.trim_end_matches([',', ')', ';', ':', '.']);
-            let tail = &word[core.len()..];
+            let tail = word.get(core.len()..).unwrap_or_default();
             match core
                 .split_once('@')
                 .and_then(|(_, rest)| rest.split_once('/'))

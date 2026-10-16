@@ -776,6 +776,16 @@ fn print_tool_call_line(summary: &str) {
     outln!("{}", style(tool_call_line(summary, width)).dim());
 }
 
+/// A session status line (e.g. `◼ shutdown · …`), dim and on a line of its own like a tool
+/// call.
+pub fn print_status_line(line: &str) {
+    if !at_line_start() {
+        outln!();
+    }
+    outln!("{}", style(sanitize_terminal_line(line)).dim());
+    let _ = std::io::stdout().flush();
+}
+
 /// Reply text, with each router-acp notice quoted in it shown as a tool-call line.
 fn render_reply_text(text: &str, buffer: &mut MarkdownBuffer, theme: Theme) {
     for segment in super::router_notices::split(text) {
