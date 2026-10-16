@@ -2581,6 +2581,23 @@ mod tests {
             Ok(())
         }
 
+        /// An agent that keeps its own conversation already holds the prompt; retrying its
+        /// empty answer would send the user's message again (four copies with three retries).
+        #[tokio::test]
+        async fn test_empty_response_from_self_managed_provider_is_not_resent() -> Result<()> {
+            let provider = Arc::new(EmptyThenTextProvider {
+                manages_own_context: true,
+                ..EmptyThenTextProvider::new(1)
+            });
+            let (messages, _) = run_reply(provider.clone(), "self-managed-empty").await?;
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+            assert!(
+                !concat_text(&messages).contains("empty response"),
+                "an agent's empty answer must not ask the user to resend: {messages:?}"
+            );
+            Ok(())
+        }
+
         /// An empty response with a queued steer hands the turn to the steer
         /// rather than the empty-turn fallback, but the empty assistant message
         /// must still not be persisted ahead of the steer.

@@ -138,6 +138,14 @@ impl Provider for GooseInferenceProvider {
         self.inner.provider_session_id()
     }
 
+    fn manages_own_context(&self) -> bool {
+        self.inner.manages_own_context()
+    }
+
+    fn context_tokens(&self) -> Option<usize> {
+        self.inner.context_tokens()
+    }
+
     async fn resume(&self, session_id: &str) -> Result<(), ProviderError> {
         self.inner.resume(session_id).await
     }

@@ -16,7 +16,7 @@ pub enum ChildStatus {
 }
 
 impl ChildStatus {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             ChildStatus::Running => "running",
             ChildStatus::Stopped => "stopped",
@@ -97,14 +97,16 @@ impl Navigator {
     pub fn handle(&mut self, key: Key, snapshot: &Snapshot, frame: &Frame) -> Outcome {
         let page = frame.transcript_rows.max(1);
         match key {
-            Key::Open | Key::Close => return Outcome::Close,
-            Key::Back if self.path.is_empty() => return Outcome::Close,
-            Key::Back => self.ascend(),
-            Key::Up => self.selected = self.selected.saturating_sub(1),
-            Key::Down => {
+            Key::Open | Key::Char('q') => return Outcome::Close,
+            Key::Escape | Key::Backspace | Key::Left if self.path.is_empty() => {
+                return Outcome::Close
+            }
+            Key::Escape | Key::Backspace | Key::Left => self.ascend(),
+            Key::Up | Key::Char('k') => self.selected = self.selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => {
                 self.selected = (self.selected + 1).min(snapshot.children.len().saturating_sub(1))
             }
-            Key::Enter => self.descend(snapshot, self.selected),
+            Key::Enter | Key::Right => self.descend(snapshot, self.selected),
             Key::PageUp => self.scroll_back += page,
             Key::PageDown => self.scroll_back = self.scroll_back.saturating_sub(page),
             Key::WheelUp if snapshot.transcript.is_some() => self.scroll_back += WHEEL_LINES,
@@ -122,8 +124,18 @@ impl Navigator {
                     self.descend(snapshot, index);
                 }
             }
+            _ => {}
         }
         Outcome::Stay
+    }
+
+    /// Starts inside `child`, as if it had been chosen from the top-level list.
+    pub fn enter(&mut self, child: &ChildRow) {
+        self.path.push(Crumb {
+            id: child.id.clone(),
+            label: child.label.clone(),
+            selected: 0,
+        });
     }
 
     fn descend(&mut self, snapshot: &Snapshot, index: usize) {
@@ -242,7 +254,7 @@ impl Navigator {
     }
 }
 
-fn child_row(child: &ChildRow, selected: bool, width: usize) -> String {
+pub(super) fn child_row(child: &ChildRow, selected: bool, width: usize) -> String {
     let marker = if selected { "›" } else { " " };
     // Router delegate ids all start with their parent's id; the tail tells them apart.
     let distinct = child
@@ -473,12 +485,12 @@ mod tests {
         assert_eq!(lines[0], "Child sessions › task second");
         assert!(lines[2].contains("task grandchild"));
 
-        navigator.handle(Key::Back, &child, &frame);
+        navigator.handle(Key::Escape, &child, &frame);
         assert_eq!(navigator.current(), None);
         let lines = plain(&navigator.render(&root, 60, 10));
         assert!(lines[3].starts_with("› "));
 
-        assert_eq!(navigator.handle(Key::Back, &root, &frame), Outcome::Close);
+        assert_eq!(navigator.handle(Key::Escape, &root, &frame), Outcome::Close);
         assert_eq!(navigator.handle(Key::Open, &root, &frame), Outcome::Close);
     }
 
