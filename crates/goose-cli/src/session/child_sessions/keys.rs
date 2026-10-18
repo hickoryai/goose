@@ -23,7 +23,10 @@ pub enum Key {
     /// raising SIGINT.
     Interrupt,
     Char(char),
-    Click { row: u16, col: u16 },
+    Click {
+        row: u16,
+        col: u16,
+    },
     WheelUp,
     WheelDown,
 }
@@ -148,7 +151,10 @@ fn parse_csi(bytes: &[u8]) -> Parsed {
             .ok()
             .and_then(|text| text.split_once(';'))
             .and_then(|(mods, code)| {
-                modified(code.parse().ok()?, mods.parse::<u16>().ok()?.saturating_sub(1))
+                modified(
+                    code.parse().ok()?,
+                    mods.parse::<u16>().ok()?.saturating_sub(1),
+                )
             }),
         (b"", final_byte) => cursor_key(final_byte),
         _ => None,
@@ -184,7 +190,9 @@ fn modified(code: u32, mods: u16) -> Option<Key> {
         97 if ctrl => Some(Key::Home),
         101 if ctrl => Some(Key::End),
         _ if ctrl => None,
-        code => char::from_u32(code).filter(|c| !c.is_control()).map(Key::Char),
+        code => char::from_u32(code)
+            .filter(|c| !c.is_control())
+            .map(Key::Char),
     }
 }
 
@@ -270,7 +278,13 @@ mod tests {
     fn ctrl_and_alt_enter_send_now() {
         assert_eq!(
             parse(b"\x1b[13;5u\x1b[27;5;13~\x1b\r\x1b\n\x1b[13u"),
-            [Key::SendNow, Key::SendNow, Key::SendNow, Key::SendNow, Key::Enter]
+            [
+                Key::SendNow,
+                Key::SendNow,
+                Key::SendNow,
+                Key::SendNow,
+                Key::Enter
+            ]
         );
     }
 

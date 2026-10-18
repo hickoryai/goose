@@ -1500,7 +1500,11 @@ pub fn display_session_info(
             style(&model_display).cyan(),
         ),
         match session_id {
-            Some(id) => format!("{} {}", style(id).dim(), style(format!("· {cwd_display}")).dim()),
+            Some(id) => format!(
+                "{} {}",
+                style(id).dim(),
+                style(format!("· {cwd_display}")).dim()
+            ),
             None => style(cwd_display).dim().to_string(),
         },
         format!("{}", style("🌱 kory is ready").white()),

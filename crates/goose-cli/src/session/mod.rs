@@ -570,9 +570,7 @@ impl CliSession {
     ) -> Result<()> {
         // Typing may start as soon as the message is sent; keep it off the output until the
         // turn's footer input reads it.
-        let _quiet = self
-            .dock()
-            .and_then(|_| child_sessions::EchoOff::start());
+        let _quiet = self.dock().and_then(|_| child_sessions::EchoOff::start());
         self.ensure_extensions_loaded(interactive).await?;
         let cancel_token = cancel_token.clone();
         self.sync_unsolicited(None).await;
@@ -2392,9 +2390,11 @@ impl CliSession {
             return;
         }
         self.dock = None;
-        let router = root
-            .clone()
-            .and_then(|id| RouterStateSource::configured().ok().map(|source| (source, id)));
+        let router = root.clone().and_then(|id| {
+            RouterStateSource::configured()
+                .ok()
+                .map(|source| (source, id))
+        });
         let dock = child_sessions::dock::Dock::start(child_sessions::dock::Sources {
             session_manager: self.agent.config.session_manager.clone(),
             session_id: self.session_id.clone(),

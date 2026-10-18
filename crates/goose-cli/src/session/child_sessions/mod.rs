@@ -19,14 +19,14 @@ use goose::providers::router_acp::{RouterStateSource, DELEGATE_ID_SEPARATOR};
 use goose::session::SessionManager;
 use goose::utils::safe_truncate;
 pub use keys::Key;
-/// Raw key input for a view the session drives itself (the dock's selection).
-pub use terminal::KeyListener as KeyReader;
-pub use terminal::EchoOff;
-/// The alternate screen, for other full-screen views (the tool-call list).
-pub use terminal::Screen;
 use rmcp::model::{ContentBlock, Role};
 use std::sync::Arc;
 use std::time::Duration;
+pub use terminal::EchoOff;
+/// Raw key input for a view the session drives itself (the dock's selection).
+pub use terminal::KeyListener as KeyReader;
+/// The alternate screen, for other full-screen views (the tool-call list).
+pub use terminal::Screen;
 pub use view::ChildRow;
 use view::{ChildStatus, LineKind, Navigator, Outcome, Snapshot, TranscriptLine};
 
@@ -331,9 +331,11 @@ pub(super) async fn goose_children(
     session_id: &str,
     turn_active: bool,
 ) -> anyhow::Result<Vec<ChildRow>> {
-    Ok(load_goose_snapshot(session_manager, session_id, None, turn_active)
-        .await?
-        .children)
+    Ok(
+        load_goose_snapshot(session_manager, session_id, None, turn_active)
+            .await?
+            .children,
+    )
 }
 
 async fn load_goose_snapshot(

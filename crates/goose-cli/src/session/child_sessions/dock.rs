@@ -1110,11 +1110,14 @@ mod tests {
         let rows = plain_rows(&state, 20, 2);
         assert_eq!(
             rows,
-            [format!("  {}", &text[18..36]), format!("  {}", &text[36..])]
+            [
+                format!("  {}", text.get(18..36).unwrap()),
+                format!("  {}", text.get(36..).unwrap())
+            ]
         );
         let rows = plain_rows(&input_state(&text, 0, 0), 20, 2);
         assert!(
-            rows[0].starts_with(&format!("› {}", &text[..18])),
+            rows[0].starts_with(&format!("› {}", text.get(..18).unwrap())),
             "{rows:?}"
         );
 
