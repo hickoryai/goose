@@ -267,6 +267,7 @@ pub struct CliSession {
     /// A `/shutdown` router-acp accepted: draining, or done.
     /// (Behind a lock so a running turn, which holds the agent's stream, can start one.)
     shutdown: std::sync::Mutex<Option<shutdown::Run>>,
+    planner_auto: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +357,7 @@ impl CliSession {
             unsolicited: None,
             dock: None,
             shutdown: std::sync::Mutex::new(None),
+            planner_auto: false,
         }
     }
 
@@ -608,6 +610,7 @@ impl CliSession {
     }
 
     async fn run_interactive(&mut self, prompt: Option<String>) -> Result<()> {
+        self.enforce_planner_mode().await?;
         if let Some(prompt) = prompt {
             let msg = Message::user().with_text(&prompt);
             self.process_message(msg, CancellationToken::default(), true)
@@ -988,6 +991,10 @@ impl CliSession {
                 return Ok(());
             }
         };
+        if self.planner_auto && mode != GooseMode::Auto {
+            output::goose_mode_message("Planner sessions stay in Auto mode for their lifetime.");
+            return Ok(());
+        }
         self.agent.update_goose_mode(mode, &self.session_id).await?;
         config.set_goose_mode(mode)?;
         output::goose_mode_message(&format!("Goose mode set to '{mode}'"));
@@ -1418,11 +1425,31 @@ impl CliSession {
         Ok(())
     }
 
+    async fn enforce_planner_mode(&mut self) -> Result<()> {
+        if !self.planner_auto && !shutdown::is_planner_session(self.messages.messages()) {
+            return Ok(());
+        }
+        if self.agent.provider(&self.session_id).await?.get_name() != "router-acp" {
+            return Ok(());
+        }
+        let current = self.agent.goose_mode(&self.session_id).await?;
+        let mode =
+            shutdown::planner_mode(&mut self.planner_auto, self.messages.messages(), current);
+        if current != mode {
+            // Updates both ACP's permission decision and the persisted session;
+            // the global config continues to govern ordinary sessions.
+            self.agent.update_goose_mode(mode, &self.session_id).await?;
+            output::goose_mode_message(shutdown::AUTO_MODE_NOTICE);
+        }
+        Ok(())
+    }
+
     async fn process_agent_response(
         &mut self,
         interactive: bool,
         cancel_token: CancellationToken,
     ) -> Result<()> {
+        self.enforce_planner_mode().await?;
         let is_json_mode = self.output_format == "json";
         let is_stream_json_mode = self.output_format == "stream-json";
 
@@ -1666,8 +1693,7 @@ impl CliSession {
                                     // Non-interactive/headless mode: refuse to run in
                                     // Approve/SmartApprove modes since auto-allowing would
                                     // bypass the safety contract those modes are meant to enforce.
-                                    let config = Config::global();
-                                    let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
+                                    let goose_mode = self.agent.goose_mode(&self.session_id).await?;
                                     if goose_mode == GooseMode::Approve || goose_mode == GooseMode::SmartApprove {
                                         cancel_token_clone.cancel();
                                         drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
@@ -4052,12 +4078,12 @@ mod tests {
         );
     }
 
-    struct StubProvider;
+    struct StubProvider(&'static str);
 
     #[async_trait::async_trait]
     impl Provider for StubProvider {
         fn get_name(&self) -> &str {
-            "stub"
+            self.0
         }
 
         async fn stream(
@@ -4107,7 +4133,7 @@ mod tests {
         ));
         agent
             .update_provider(
-                Arc::new(StubProvider),
+                Arc::new(StubProvider("stub")),
                 goose_providers::model::ModelConfig::new("stub-model"),
                 &session.id,
             )
@@ -4127,6 +4153,39 @@ mod tests {
             extension_loading,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn planner_mode_updates_persisted_session_and_survives_later_operator_turns() {
+        let mut session = session_with_loader(None, false).await;
+        session
+            .agent
+            .update_provider(
+                Arc::new(StubProvider("router-acp")),
+                goose_providers::model::ModelConfig::new("stub-model"),
+                &session.session_id,
+            )
+            .await
+            .unwrap();
+        session
+            .agent
+            .update_goose_mode(GooseMode::Approve, &session.session_id)
+            .await
+            .unwrap();
+        session.push_message(Message::user().with_text("/implement Docs/Plans/X.md"));
+        session.enforce_planner_mode().await.unwrap();
+        assert_eq!(
+            session.agent.goose_mode(&session.session_id).await.unwrap(),
+            GooseMode::Auto
+        );
+        session.handle_goose_mode("approve").await.unwrap();
+        session.messages = Conversation::default();
+        session.push_message(Message::user().with_text("continue the release"));
+        session.enforce_planner_mode().await.unwrap();
+        assert_eq!(
+            session.agent.goose_mode(&session.session_id).await.unwrap(),
+            GooseMode::Auto
+        );
     }
 
     #[tokio::test]
