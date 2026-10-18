@@ -900,6 +900,7 @@ kory session --name use-custom-theme
 
 **Session Control:**
 - **`Ctrl+C`** - Clear the current line if text is entered, interrupt the current request if processing, or exit the session if line is empty
+- In a router planner session, cancelling a turn leaves the run active. goose prints the live worker and admissible-work counts, with `unknown` when the router cannot supply them. The prompt offers the shutdown quit confirmation; a second Ctrl+C within five seconds exits. `/shutdown` saves state and drains workers. `/exit` quits immediately and warns when workers may be cut off.
 - **`Ctrl+J`** - Add a newline. Can customize the character via `GOOSE_CLI_NEWLINE_KEY` in the [config file](/docs/guides/config-files) (e.g. `GOOSE_CLI_NEWLINE_KEY: n`) or as an [environment variable](/docs/guides/environment-variables#session-management). Avoid "c" and common terminal shortcuts like "r", "w", "z".
 
 **Navigation:**

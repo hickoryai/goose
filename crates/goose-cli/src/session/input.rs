@@ -16,6 +16,7 @@ use strum::VariantNames;
 pub enum InputResult {
     Message(String),
     Exit,
+    Interrupt,
     AddExtension(String),
     AddBuiltin(String),
     ToggleTheme,
@@ -77,9 +78,16 @@ impl rustyline::ConditionalEventHandler for CtrlCHandler {
             // Clear the line if there's text
             let mut cache = self.completion_cache.write().unwrap();
             cache.hint_status = HintStatus::Default;
+            if let Some(guard) = cache.planner_quit.as_mut() {
+                *guard = Default::default();
+            }
             Some(rustyline::Cmd::Kill(rustyline::Movement::WholeBuffer))
         } else {
             let mut cache = self.completion_cache.write().unwrap();
+
+            if cache.planner_quit.is_some() {
+                return Some(rustyline::Cmd::Interrupt);
+            }
 
             if cache.hint_status == HintStatus::MaybeExit {
                 return Some(rustyline::Cmd::Interrupt);
@@ -381,7 +389,7 @@ pub fn get_input(
     let input = match read {
         Ok(text) => text,
         Err(e) => match e {
-            rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
+            rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Interrupt),
             rustyline::error::ReadlineError::Eof => return Ok(InputResult::Exit),
             _ => return Err(e.into()),
         },

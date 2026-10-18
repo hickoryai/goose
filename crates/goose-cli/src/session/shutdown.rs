@@ -12,6 +12,37 @@ use tokio::sync::broadcast;
 
 pub const REQUEST: &str = "_router/planner_shutdown";
 pub const PROGRESS: &str = "_router/shutdown_progress";
+pub const STATUS: &str = "_router/planner_status";
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Census {
+    pub live: Option<usize>,
+    pub admissible: Option<usize>,
+}
+
+impl Census {
+    pub fn interrupted_line(&self) -> String {
+        let count = |n: Option<usize>| n.map_or_else(|| "unknown".into(), |n| n.to_string());
+        format!("run still active: {} live workers, {} admissible; /shutdown drains, /exit quits and cuts workers off", count(self.live), count(self.admissible))
+    }
+
+    pub fn exit_warning(&self, draining: bool) -> Option<&'static str> {
+        (draining || self.live != Some(0)).then_some(EXIT_WARNING)
+    }
+}
+
+pub async fn census(provider: &dyn Provider) -> Census {
+    // Cancellation must return control promptly even with an older/unresponsive router.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        provider.extension_request(STATUS, serde_json::json!({})),
+    )
+    .await
+    {
+        Ok(Ok(value)) => serde_json::from_value(value).unwrap_or_default(),
+        _ => Census::default(),
+    }
+}
 
 pub const REFUSED: &str = "  /shutdown only works in an /implement (router-acp planner) session.";
 pub const BLOCKED: &str =
@@ -143,6 +174,8 @@ pub fn line(progress: &Progress) -> String {
                 .collect();
             if !workers.is_empty() {
                 body.push_str(&format!(" ({})", workers.join(", ")));
+            } else if !progress.message.is_empty() {
+                body.push_str(&format!(" · {}", progress.message));
             }
             body
         }
@@ -248,9 +281,9 @@ impl Gate {
 }
 
 /// Ctrl-C while the prompt waits on a shutdown: the first press warns, the second quits.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct QuitGuard {
-    pressed: bool,
+    pressed_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -261,7 +294,13 @@ pub enum QuitStep {
 
 impl QuitGuard {
     pub fn press(&mut self) -> QuitStep {
-        if std::mem::replace(&mut self.pressed, true) {
+        self.press_at(std::time::Instant::now())
+    }
+
+    pub fn press_at(&mut self, now: std::time::Instant) -> QuitStep {
+        if self.pressed_at.replace(now).is_some_and(|last| {
+            now.saturating_duration_since(last) <= std::time::Duration::from_secs(5)
+        }) {
             QuitStep::Quit
         } else {
             QuitStep::Confirm
@@ -347,6 +386,15 @@ mod tests {
     }
 
     #[test]
+    fn parent_shutdown_wait_is_visible_before_workers_start_draining() {
+        let waiting = progress(
+            json!({"phase":"draining","workersTotal":0,"workersStopped":0,
+            "message":"waiting for the parent's shutdown handoff"}),
+        );
+        assert!(line(&waiting).contains("waiting for the parent's shutdown handoff"));
+    }
+
+    #[test]
     fn only_this_sessions_progress_is_read() {
         let other = ExtensionNotification {
             method: PROGRESS.to_string(),
@@ -413,6 +461,48 @@ mod tests {
         let mut guard = QuitGuard::default();
         assert_eq!(guard.press(), QuitStep::Confirm);
         assert_eq!(guard.press(), QuitStep::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_during_a_planner_turn_arms_prompt_exit_for_five_seconds() {
+        let now = std::time::Instant::now();
+        let mut guard = QuitGuard::default();
+        assert_eq!(guard.press_at(now), QuitStep::Confirm);
+        assert_eq!(
+            guard.press_at(now + std::time::Duration::from_secs(5)),
+            QuitStep::Quit
+        );
+        let mut expired = QuitGuard::default();
+        assert_eq!(expired.press_at(now), QuitStep::Confirm);
+        assert_eq!(
+            expired.press_at(now + std::time::Duration::from_secs(6)),
+            QuitStep::Confirm
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_planner_turn_reports_census_and_exit_warns_about_live_workers() {
+        let router = router(Ok(json!({"status":"running","live":2,"admissible":7})));
+        let census = census(&router).await;
+        assert_eq!(census.interrupted_line(), "run still active: 2 live workers, 7 admissible; /shutdown drains, /exit quits and cuts workers off");
+        assert_eq!(census.exit_warning(false), Some(EXIT_WARNING));
+        assert_eq!(router.asked.lock().unwrap()[0], (STATUS.into(), json!({})));
+        let idle = Census {
+            live: Some(0),
+            admissible: Some(0),
+        };
+        assert_eq!(idle.exit_warning(false), None);
+        assert_eq!(idle.exit_warning(true), Some(EXIT_WARNING));
+    }
+
+    #[tokio::test]
+    async fn an_old_router_does_not_report_unknown_workers_as_zero() {
+        let router = router(Err("method unavailable".into()));
+        let census = census(&router).await;
+        assert!(census
+            .interrupted_line()
+            .contains("unknown live workers, unknown admissible"));
+        assert_eq!(census.exit_warning(false), Some(EXIT_WARNING));
     }
 
     struct Router {

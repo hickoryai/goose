@@ -285,6 +285,7 @@ pub struct CompletionCache {
     pub current_session_provider: String,
     pub last_updated: Instant,
     pub hint_status: HintStatus,
+    pub planner_quit: Option<shutdown::QuitGuard>,
 }
 
 impl CompletionCache {
@@ -297,6 +298,7 @@ impl CompletionCache {
             current_session_provider: String::new(),
             last_updated: Instant::now(),
             hint_status: HintStatus::Default,
+            planner_quit: None,
         }
     }
 }
@@ -686,17 +688,46 @@ impl CliSession {
             }
 
             output::run_status_hook("waiting");
+            if shutdown::is_planner_session(self.messages.messages())
+                && self.router_session_id().await.is_some()
+            {
+                self.completion_cache
+                    .write()
+                    .unwrap()
+                    .planner_quit
+                    .get_or_insert_with(Default::default);
+            }
             tool_calls::set_available(tool_calls::has_tool_calls(self.messages.messages()));
             let input = input::get_input(
                 &mut editor,
                 Some(&conversation_strings),
                 self.unsolicited.as_ref(),
             )?;
-            if matches!(input, InputResult::Exit) {
-                if self.shutdown_gate() == shutdown::Gate::Draining {
-                    output::print_status_line(shutdown::EXIT_WARNING);
+            if matches!(input, InputResult::Interrupt) {
+                let step = self
+                    .completion_cache
+                    .write()
+                    .unwrap()
+                    .planner_quit
+                    .as_mut()
+                    .map(shutdown::QuitGuard::press);
+                if step == Some(shutdown::QuitStep::Confirm) {
+                    output::print_status_line(shutdown::QUIT_CONFIRM);
+                    show_status = false;
+                    continue;
                 }
+                self.warn_planner_exit().await;
                 break;
+            }
+            if matches!(input, InputResult::Exit) {
+                self.warn_planner_exit().await;
+                break;
+            }
+            // New instructions break the consecutive Ctrl-C sequence.
+            if matches!(input, InputResult::Message(_)) {
+                if let Some(guard) = self.completion_cache.write().unwrap().planner_quit.as_mut() {
+                    *guard = Default::default();
+                }
             }
             if matches!(input, InputResult::DockFocus | InputResult::ToolFocus) {
                 // The line editor accepted the empty line to hand over the keys; take that
@@ -750,7 +781,9 @@ impl CliSession {
                 self.handle_message_input(&content, history, editor).await?;
             }
             InputResult::Shutdown => self.start_shutdown().await,
-            InputResult::Exit => unreachable!("Exit is handled in the main loop"),
+            InputResult::Exit | InputResult::Interrupt => {
+                unreachable!("Exit is handled in the main loop")
+            }
             InputResult::AddExtension(cmd) => {
                 history.save(editor);
                 match self.add_extension(cmd.clone()).await {
@@ -1410,8 +1443,11 @@ impl CliSession {
             .last()
             .ok_or_else(|| anyhow::anyhow!("No user message"))?;
         let cancel_token_interrupt = cancel_token.clone();
+        let interrupted_at = Arc::new(std::sync::Mutex::new(None));
+        let signal_time = interrupted_at.clone();
         let handle = tokio::spawn(async move {
             if ctrl_c().await.is_ok() {
+                *signal_time.lock().unwrap() = Some(Instant::now());
                 cancel_token_interrupt.cancel();
             }
         });
@@ -1952,6 +1988,23 @@ impl CliSession {
         }
 
         if interactive {
+            let signal_time = *interrupted_at.lock().unwrap();
+            if let Some(at) = signal_time {
+                if shutdown::is_planner_session(self.messages.messages())
+                    && self.router_session_id().await.is_some()
+                {
+                    {
+                        let mut cache = self.completion_cache.write().unwrap();
+                        cache
+                            .planner_quit
+                            .get_or_insert_with(Default::default)
+                            .press_at(at);
+                        cache.hint_status = HintStatus::MaybeExit;
+                    }
+                    let census = self.planner_census().await;
+                    output::print_status_line(&census.interrupted_line());
+                }
+            }
             output::emit_attention_bell();
         }
 
@@ -2460,6 +2513,25 @@ impl CliSession {
 
     fn shutdown_gate(&self) -> shutdown::Gate {
         shutdown::Gate::of(self.shutdown.lock().unwrap().as_ref())
+    }
+
+    async fn planner_census(&self) -> shutdown::Census {
+        match self.agent.provider(&self.session_id).await {
+            Ok(provider) => shutdown::census(provider.as_ref()).await,
+            Err(_) => shutdown::Census::default(),
+        }
+    }
+
+    async fn warn_planner_exit(&self) {
+        let draining = self.shutdown_gate() == shutdown::Gate::Draining;
+        if draining
+            || (shutdown::is_planner_session(self.messages.messages())
+                && self.router_session_id().await.is_some())
+        {
+            if let Some(line) = self.planner_census().await.exit_warning(draining) {
+                output::print_status_line(line);
+            }
+        }
     }
 
     fn take_shutdown_notifications(
