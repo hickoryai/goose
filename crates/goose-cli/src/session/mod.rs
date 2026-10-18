@@ -1393,6 +1393,13 @@ impl CliSession {
         let is_json_mode = self.output_format == "json";
         let is_stream_json_mode = self.output_format == "stream-json";
 
+        // A command-line prompt starts its turn before the interactive prompt creates a
+        // dock. Open the provider first so its router session is known on that first turn.
+        if interactive && !is_json_mode && !is_stream_json_mode {
+            let _provider = self.agent.provider(&self.session_id).await?;
+            self.sync_dock(true).await;
+        }
+
         let session_config = SessionConfig {
             id: self.session_id.clone(),
             schedule_id: self.scheduled_job_id.clone(),
