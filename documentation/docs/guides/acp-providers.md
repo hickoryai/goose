@@ -70,7 +70,7 @@ Runs [router-acp](https://github.com/zaneclaes/router-acp), which routes each se
 
 **Requirements:**
 - `router-acp` binary installed and in your PATH
-- A router configuration with connected provider accounts (default `~/.config/router-acp/router.yaml`)
+- A router configuration with connected provider accounts (user default `~/.config/router-acp/router.yaml`, with optional project overrides in `.router-acp/router.yaml`)
 
 ## Setup Instructions
 
@@ -221,11 +221,32 @@ Replacing the npm package does not change `~/.codex` or require recreating your 
 
    ```bash
    export GOOSE_PROVIDER=router-acp
-   # Only needed when your configuration is not at ~/.config/router-acp/router.yaml
+   # Optional: explicitly select a file instead of project discovery
    export ROUTER_ACP_CONFIG=/path/to/router.yaml
    ```
 
    Or configure through the goose CLI using `kory configure`.
+
+   Without an explicit `ROUTER_ACP_CONFIG` setting, goose asks router-acp to
+   find the nearest `.router-acp/router.yaml` from the session's working
+   directory through its git root, then falls back to the user's default.
+   Project files overlay user settings: accounts merge by name, project-only
+   accounts are appended, and project reserves and priorities override the
+   inherited values. Project edits save only their differences. This requires a
+   router-acp version supporting `config-path`.
+
+   The native `/login` flow asks whether new accounts belong to System or
+   Project. Existing accounts offer **Change account scope** and separate
+   **Reserve Capacity (System)** and **Reserve Capacity (Project)** menus.
+   Either reserve window at **100% (disabled)** excludes the account, even
+   with unknown usage. A project reserve can disable an inherited account.
+
+   MCP identities use the same scope choices under **/login → MCP accounts**.
+   The router saves profile selections in `.router-acp/router.yaml` under
+   `mcp_accounts`, preserving generated `.mcp.json` files. Manually configured
+   `oauth.account` profiles are also supported. A project profile has independent
+   credentials and never falls back to the default account. Credentials remain
+   in the user's router-acp store; moving scope preserves the saved login.
 
    If you previously pointed the `pi-acp` provider at a shim that runs `router-acp serve`, switch `GOOSE_PROVIDER` to `router-acp` and remove the shim.
 
@@ -321,7 +342,7 @@ See [codex-acp](https://github.com/agentclientprotocol/codex-acp) for session mo
 | Environment Variable | Description                    | Default                           |
 |----------------------|--------------------------------|-----------------------------------|
 | `GOOSE_PROVIDER`     | Set to `router-acp`            | None                              |
-| `ROUTER_ACP_CONFIG`  | Path to the router-acp config  | `~/.config/router-acp/router.yaml` |
+| `ROUTER_ACP_CONFIG`  | Explicit router-acp config path | Nearest `.router-acp/router.yaml`, then `~/.config/router-acp/router.yaml` |
 | `GOOSE_MODEL`        | Model to use                   | `current`                         |
 | `GOOSE_MODE`         | Permission mode                | `auto`                            |
 
