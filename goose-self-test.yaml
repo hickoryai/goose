@@ -28,7 +28,7 @@ parameters:
     input_type: string
     requirement: optional
     default: "all"
-    description: "Which test phases to run: all, basic, extensions, delegation, declared-vision, reasoning, zai-coding-plan, acp-effort, compaction, advanced"
+    description: "Which test phases to run: all, basic, extensions, delegation, declared-vision, reasoning, zai-coding-plan, acp-effort, compaction, headless-check, advanced"
 
   - key: test_depth
     input_type: string
@@ -70,6 +70,12 @@ instructions: |
   - Test both success and failure paths
   - Document everything meticulously
   - Handle errors gracefully - a test failure shouldn't stop the suite
+
+  When test_phases is headless-check, run only the goose-cli skill_check regression tests
+  using the checkout's existing resource/build launcher. Verify successful validator exit,
+  rejected final results, malformed opt-in metadata, startup errors, literal arguments and
+  bounded validator timeout. Report their actual exit status. Do not run the other phases,
+  delegate work, call external services or interpret a model saying PASS as test evidence.
 
   ## Test Execution Framework
 
@@ -134,6 +140,14 @@ extensions:
 prompt: |
   Execute the Goose Self-Testing Integration Suite in {{ workspace_dir }}.
   Test phases: {{ test_phases }}, Depth: {{ test_depth }}, Parallel: {{ parallel_tests }}
+
+  {% if test_phases == "headless-check" %}
+  Run only `cargo test --release -p goose-cli --lib skill_check -- --nocapture`
+  through the existing resource/build launcher. Report its actual exit status and test counts,
+  then finish. Do not execute the initialization or other phases below, delegate, edit source,
+  or call external services. The tests must cover validator success, failure, missing executable,
+  timeout, literal arguments, and invalid metadata.
+  {% endif %}
 
   ## 🚀 INITIALIZATION
   Create test workspace using `mkdir -p {{ workspace_dir }}/archive` for all test artifacts and reports.
