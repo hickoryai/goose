@@ -15,6 +15,7 @@ activities:
   - Test extension discovery and management
   - Test load tool for knowledge injection and discovery
   - Test delegate tool for task delegation
+  - Validate live child-session model and elapsed-time labels
   - Test multi-turn thinking preservation for providers that reject replayed reasoning_content
   - Test Z.AI Coding Plan streamed tool calls and interruption recovery
   - Validate ACP thinking-effort discovery, forwarding, and provider switching
@@ -28,7 +29,7 @@ parameters:
     input_type: string
     requirement: optional
     default: "all"
-    description: "Which test phases to run: all, basic, extensions, delegation, declared-vision, reasoning, zai-coding-plan, acp-effort, compaction, headless-check, advanced"
+    description: "Which test phases to run: all, basic, extensions, delegation, children-ui, declared-vision, reasoning, zai-coding-plan, acp-effort, compaction, headless-check, advanced"
 
   - key: test_depth
     input_type: string
@@ -76,6 +77,14 @@ instructions: |
   rejected final results, malformed opt-in metadata, startup errors, literal arguments and
   bounded validator timeout. Report their actual exit status. Do not run the other phases,
   delegate work, call external services or interpret a model saying PASS as test evidence.
+
+  When test_phases is children-ui, run only
+  `GOOSE_DISABLE_KEYRING=1 cargo test --release -p goose-cli --lib session::child_sessions`
+  from the checkout after sourcing bin/activate-hermit. Verify that running child rows show
+  their model and elapsed duration, duration advances without new child data, router delegate
+  metadata reaches both the dock and navigator, and completed/failed states remain visible.
+  Report the actual test exit status. Do not run other phases or delegate work. The headless
+  recipe cannot inspect a terminal dock; live terminal behavior requires interactive checking.
 
   ## Test Execution Framework
 
@@ -140,6 +149,13 @@ extensions:
 prompt: |
   Execute the Goose Self-Testing Integration Suite in {{ workspace_dir }}.
   Test phases: {{ test_phases }}, Depth: {{ test_depth }}, Parallel: {{ parallel_tests }}
+
+  {% if test_phases == "children-ui" %}
+  Run only `source bin/activate-hermit && GOOSE_DISABLE_KEYRING=1 cargo test --release -p goose-cli --lib session::child_sessions`.
+  Report its actual exit status and test counts, then finish. Do not execute initialization
+  or other phases below, delegate work, or edit source. Check model and elapsed-time rendering,
+  elapsed-time boundaries, router metadata, existing status labels, and terminal width limits.
+  {% endif %}
 
   {% if test_phases == "headless-check" %}
   Run only `cargo test --release -p goose-cli --lib skill_check -- --nocapture`

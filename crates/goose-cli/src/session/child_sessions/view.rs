@@ -1,4 +1,5 @@
 use super::keys::Key;
+use chrono::{DateTime, Utc};
 use console::{measure_text_width, style, truncate_str};
 use goose::providers::router_acp::DELEGATE_ID_SEPARATOR;
 use unicode_segmentation::UnicodeSegmentation;
@@ -32,7 +33,27 @@ pub struct ChildRow {
     pub id: String,
     pub label: String,
     pub status: ChildStatus,
+    pub model: String,
+    pub started_at: Option<DateTime<Utc>>,
     pub activity: String,
+}
+
+impl ChildRow {
+    fn running_label(&self, now: DateTime<Utc>) -> String {
+        let model = sanitize(&self.model);
+        let Some(started_at) = self.started_at else {
+            return model;
+        };
+        let seconds = (now - started_at).num_seconds().max(0);
+        let elapsed = if seconds < 60 {
+            format!("{seconds}s")
+        } else if seconds < 3600 {
+            format!("{}m", seconds / 60)
+        } else {
+            format!("{}h{}m", seconds / 3600, seconds / 60 % 60)
+        };
+        format!("{model} [{elapsed}]")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,9 +283,14 @@ pub(super) fn child_row(child: &ChildRow, selected: bool, width: usize) -> Strin
         .rsplit_once(DELEGATE_ID_SEPARATOR)
         .map_or(child.id.as_str(), |(_, tail)| tail);
     let short_id: String = distinct.chars().take(SHORT_ID_CHARS).collect();
+    let detail = if child.status == ChildStatus::Running {
+        child.running_label(Utc::now())
+    } else {
+        child.status.label().to_string()
+    };
     let row = format!(
         "{marker} {:<9} {}  {short_id}  {}",
-        child.status.label(),
+        detail,
         sanitize(&child.label),
         sanitize(&child.activity)
     );
@@ -326,6 +352,8 @@ mod tests {
             id: id.to_string(),
             label: format!("task {id}"),
             status,
+            model: "opus 5.5".to_string(),
+            started_at: None,
             activity: "reading files".to_string(),
         }
     }
@@ -367,13 +395,38 @@ mod tests {
         assert_eq!(lines[0], "Child sessions");
         assert_eq!(
             lines[2],
-            "› running   task aaaaaaaaaa  aaaaaaaa  reading files"
+            "› opus 5.5  task aaaaaaaaaa  aaaaaaaa  reading files"
         );
         assert_eq!(
             lines[3],
             "  failed    task bbbbbbbbbb  bbbbbbbb  reading files"
         );
         assert!(lines[9].starts_with("↑↓ select"));
+    }
+
+    #[test]
+    fn running_label_advances_without_new_child_data() {
+        let start: DateTime<Utc> = "2026-10-19T10:00:00Z".parse().unwrap();
+        let mut child = row("child", ChildStatus::Running);
+        child.started_at = Some(start);
+        for (seconds, expected) in [
+            (-1, "0s"),
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m"),
+            (3599, "59m"),
+            (3600, "1h0m"),
+            (10920, "3h2m"),
+        ] {
+            assert_eq!(
+                child.running_label(start + chrono::Duration::seconds(seconds)),
+                format!("opus 5.5 [{expected}]")
+            );
+        }
+        child.started_at = Some(Utc::now() - chrono::Duration::minutes(182));
+        let rendered = child_row(&child, false, 100);
+        assert!(rendered.contains("opus 5.5 [3h2m]"), "{rendered}");
+        assert!(!rendered.contains("running"));
     }
 
     #[test]

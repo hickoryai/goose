@@ -118,6 +118,11 @@ pub fn dock_rows(delegates: &[RouterDelegate], root: &str, now: DateTime<Utc>) -
             id: delegate.id.clone(),
             label,
             status: delegate_status(delegate, now),
+            model: delegate
+                .model
+                .clone()
+                .unwrap_or_else(|| "unknown model".to_string()),
+            started_at: delegate.created_at,
             activity: latest_activity(&delegate.log),
         });
     }
@@ -132,6 +137,11 @@ pub fn rows_for(delegates: &[RouterDelegate], parent: &str, now: DateTime<Utc>) 
             id: delegate.id.clone(),
             label: delegate_label(delegate),
             status: delegate_status(delegate, now),
+            model: delegate
+                .model
+                .clone()
+                .unwrap_or_else(|| "unknown model".to_string()),
+            started_at: delegate.created_at,
             activity: latest_activity(&delegate.log),
         })
         .collect()
@@ -363,6 +373,11 @@ mod tests {
             ]
         );
         assert!(rows[1].activity.starts_with("→ P=/work/repo; for i in"));
+        assert_eq!(rows[0].model, "opus[1m]");
+        assert_eq!(rows[0].started_at, Some(at("2026-10-13T20:32:10Z")));
+        let dock = dock_rows(&delegates, ROOT, at("2026-10-13T20:41:00Z"));
+        assert_eq!(dock[0].model, rows[0].model);
+        assert_eq!(dock[0].started_at, rows[0].started_at);
         assert!(rows_for(&delegates, &rows[0].id, at("2026-10-13T20:41:00Z")).is_empty());
     }
 

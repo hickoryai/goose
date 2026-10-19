@@ -827,6 +827,8 @@ mod tests {
             id: id.into(),
             label: id.into(),
             status,
+            model: "opus 5.5".to_string(),
+            started_at: None,
             activity: String::new(),
         }
     }
@@ -897,7 +899,7 @@ mod tests {
         }
         assert_eq!((state.selected, state.offset), (Some(5), 4));
         let plain = console::strip_ansi_codes(&frame(&state, 80, 30)).to_string();
-        assert!(plain.contains("› running   5"), "{plain}");
+        assert!(plain.contains("› opus 5.5  5"), "{plain}");
         assert!(plain.contains("↑ 4 above · ↓ 4 more"), "{plain}");
         state.selected = None;
         follow_selection(&mut state);

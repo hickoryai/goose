@@ -357,6 +357,11 @@ async fn load_goose_snapshot(
         .into_iter()
         .map(|child| ChildRow {
             status: child_status(states.get(&child.id).copied(), turn_active),
+            model: child
+                .model_config
+                .map(|config| config.model_name)
+                .unwrap_or_else(|| "unknown model".to_string()),
+            started_at: Some(child.created_at),
             label: child.name,
             activity: child.last_message_snippet.unwrap_or_default(),
             id: child.id,
