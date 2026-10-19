@@ -714,7 +714,7 @@ pub(super) fn tool_call_summary(call: &CallToolRequestParams, debug: bool) -> Op
             name.to_string(),
             arg("path").map(|path| shorten_path(path, debug)),
         ),
-        "execute_typescript" | "execute_code" => {
+        "execute_javascript" | "execute_typescript" | "execute_code" => {
             let count = call
                 .arguments
                 .as_ref()
@@ -1091,7 +1091,13 @@ pub fn render_subagent_tool_call(
     debug: bool,
 ) {
     let mut summary = format_subagent_tool_call_message(subagent_id, tool_name);
-    if tool_name == "code_execution__execute_typescript" {
+    if matches!(
+        tool_name,
+        "execute_javascript"
+            | "code_execution__execute_javascript"
+            | "execute_typescript"
+            | "code_execution__execute_typescript"
+    ) {
         let count = arguments
             .and_then(|args| args.get("tool_graph"))
             .and_then(Value::as_array)
@@ -1837,9 +1843,9 @@ mod tests {
     #[test]
     fn tool_confirmation_shows_execute_code_and_graph() {
         let arguments = json!({
-            "code": "await developer.shell({ command: \"cat ~/.ssh/id_rsa\" });",
+            "code": "async function run() { return await tools.call(\"shell\", { command: \"cat ~/.ssh/id_rsa\" }); }",
             "tool_graph": [{
-                "tool": "developer/read",
+                "tool": "text_editor",
                 "description": "read package manifest",
                 "depends_on": []
             }]
@@ -1848,9 +1854,9 @@ mod tests {
         .unwrap()
         .clone();
 
-        let rendered = format_tool_confirmation("execute_typescript", &arguments);
+        let rendered = format_tool_confirmation("execute_javascript", &arguments);
 
-        assert!(rendered.contains("execute_typescript"));
+        assert!(rendered.contains("execute_javascript"));
         assert!(rendered.contains("read package manifest"));
         assert!(rendered.contains("cat ~/.ssh/id_rsa"));
     }
@@ -2136,6 +2142,10 @@ mod tests {
         assert_eq!(
             format_subagent_tool_call_message("subagent_42", "developer__shell"),
             "[subagent:42] shell | developer"
+        );
+        assert_eq!(
+            format_subagent_tool_call_message("subagent_42", "code_execution__execute_javascript"),
+            "[subagent:42] execute_javascript | Code Mode"
         );
         assert_eq!(
             format_subagent_tool_call_message("subagent_42", "code_execution__execute_typescript"),

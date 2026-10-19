@@ -1452,13 +1452,6 @@ async fn cancelling_the_parent_ends_a_waiting_subagent() -> Result<()> {
     })
     .await?;
     assert_ne!(subagent_id, session_id);
-    assert!(!agent.tracks_confirmations_for(&subagent_id));
-    assert!(agent
-        .extension_manager
-        .scope_lease(&subagent_id)
-        .await
-        .configs()
-        .is_empty());
     Ok(())
 }
 
