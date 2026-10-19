@@ -290,8 +290,15 @@ pub(crate) async fn stream_response_from_provider(
 ) -> Result<MessageStream, ProviderError> {
     let config = model_config.clone();
 
-    let projected_messages =
-        Conversation::new_unvalidated(messages.iter().cloned()).agent_visible_messages();
+    // ACP cannot discard internal tool instructions after role merging folds
+    // them into the user's request and loses their turn-context marker.
+    let projected_messages = Conversation::new_unvalidated(
+        messages
+            .iter()
+            .filter(|message| !provider.manages_own_context() || !message.is_turn_context())
+            .cloned(),
+    )
+    .agent_visible_messages();
     let (filtered_messages, _) =
         fix_conversation(Conversation::new_unvalidated(projected_messages));
     let filtered_messages = Conversation::new_unvalidated(merge_consecutive_messages_for_request(
@@ -609,12 +616,17 @@ mod tests {
     #[derive(Clone)]
     struct CapturingProvider {
         messages: Arc<Mutex<Vec<Message>>>,
+        owns_context: bool,
     }
 
     #[async_trait]
     impl Provider for CapturingProvider {
         fn get_name(&self) -> &str {
             "capturing"
+        }
+
+        fn manages_own_context(&self) -> bool {
+            self.owns_context
         }
 
         async fn stream(
@@ -628,6 +640,43 @@ mod tests {
             let message = Message::assistant().with_text("ok");
             let usage = ProviderUsage::new("capturing".to_string(), Usage::default());
             Ok(stream_from_single_message(message, usage))
+        }
+    }
+
+    #[tokio::test]
+    async fn native_agent_provider_filters_turn_context_before_merging() {
+        use crate::conversation::message::MessageMetadata;
+
+        for owns_context in [false, true] {
+            let messages = vec![
+                Message::user().with_text("implement"),
+                Message::user()
+                    .with_text("<turn-context>Use execute_typescript only</turn-context>")
+                    .with_metadata(MessageMetadata::agent_only().with_turn_context()),
+            ];
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(CapturingProvider {
+                messages: captured.clone(),
+                owns_context,
+            });
+            let _stream = stream_response_from_provider(
+                provider,
+                ModelConfig::new("test-model"),
+                "test-session",
+                "system",
+                &messages,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(captured[0].as_concat_text().contains("implement"));
+            assert_eq!(
+                captured[0].as_concat_text().contains("execute_typescript"),
+                !owns_context
+            );
         }
     }
 
@@ -690,6 +739,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(CapturingProvider {
             messages: captured.clone(),
+            owns_context: false,
         });
 
         let _stream = stream_response_from_provider(
@@ -722,6 +772,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(CapturingProvider {
             messages: captured.clone(),
+            owns_context: false,
         });
 
         let _stream = stream_response_from_provider(
@@ -766,6 +817,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(CapturingProvider {
             messages: captured.clone(),
+            owns_context: false,
         });
 
         let _stream = stream_response_from_provider(

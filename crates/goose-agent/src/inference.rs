@@ -461,6 +461,11 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
                 }
             }
 
+            // Native agents own their tools and context. Filter Goose's internal
+            // instructions before role merging erases the turn-context marker.
+            if self.provider.manages_own_context() {
+                messages_for_provider.retain(|message| !message.is_turn_context());
+            }
             let projected =
                 Conversation::new_unvalidated(messages_for_provider).agent_visible_messages();
             let (fixed, _) = fix_conversation(Conversation::new_unvalidated(projected));

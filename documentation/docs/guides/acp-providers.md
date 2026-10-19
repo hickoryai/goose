@@ -11,6 +11,11 @@ goose supports [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) a
 
 ACP providers pass goose [extensions](/docs/getting-started/using-extensions) through to the agent as MCP servers, so the agent can call your extensions directly.
 
+The downstream agent owns tool execution and discovery. Goose's internal turn-context
+instructions, including Code Mode's `execute_typescript` callbacks, stay in Goose's session
+history and are excluded before preparing the ACP request. They do not require an ACP agent
+to expose Goose's executor; router delegation tools use the downstream agent's MCP interface.
+
 :::tip Use Your Existing Subscriptions
 ACP providers let you use goose with your existing Claude Code or ChatGPT Plus/Pro subscriptions — no per-token API costs. They are the recommended replacement for the deprecated [CLI providers](/docs/guides/cli-providers).
 :::

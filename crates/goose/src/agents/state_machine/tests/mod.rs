@@ -230,6 +230,31 @@ async fn turn_context_is_persisted_once_per_turn_and_reused_across_inferences() 
 }
 
 #[tokio::test]
+async fn native_agent_provider_does_not_receive_goose_turn_context() -> Result<()> {
+    let (pipeline, api) = pipeline::test_pipeline_with(dummy_api::ProviderFeatures {
+        manages_own_context: true,
+        ..Default::default()
+    })
+    .await?;
+    api.on("hello").reply("hi there!");
+
+    let result = pipeline.run(["hello"]).await?;
+
+    assert!(result
+        .conversation()
+        .messages()
+        .iter()
+        .any(|m| m.is_turn_context()));
+    let calls = api.calls();
+    assert!(!calls.is_empty());
+    assert!(calls.iter().all(|call| call.input_contains("hello")));
+    assert!(calls
+        .iter()
+        .all(|call| !call.input_contains("<turn-context>")));
+    Ok(())
+}
+
+#[tokio::test]
 async fn goal_starts_nudges_and_clears_when_met() -> Result<()> {
     let (pipeline, api) = test_pipeline().await?;
     api.on("Start working toward this goal now")
