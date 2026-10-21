@@ -2280,7 +2280,7 @@ async fn handle_run_command(
 
     let parsed = parse_run_input(&input_opts, output_opts.quiet)?;
 
-    let Some((input_config, recipe)) = parsed else {
+    let Some((mut input_config, recipe)) = parsed else {
         return Ok(());
     };
 
@@ -2303,6 +2303,28 @@ async fn handle_run_command(
         goose_mode,
     )
     .await?;
+
+    let completion_check = if !run_behavior.interactive {
+        input_config
+            .contents
+            .as_deref()
+            .map(|prompt| {
+                crate::skill_check::SkillCheck::for_prompt(
+                    prompt,
+                    &format!("skill-{:032x}", rand::random::<u128>()),
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(check) = &completion_check {
+        // ACP providers own their system prompts. Put this invocation's result contract
+        // beside the canonical expanded skill so every provider receives it.
+        input_config.contents = Some(check.prompt());
+    }
+    let check_output_format = output_opts.output_format.clone();
 
     let mut session = build_session(SessionBuilderConfig {
         session_id,
@@ -2342,7 +2364,18 @@ async fn handle_run_command(
             "Headless session started"
         );
 
-        let result = session.headless(contents).await;
+        let mut result = session.headless(contents).await;
+        if let Some(check) = completion_check {
+            let response = session
+                .message_history()
+                .last()
+                .map(|message| message.as_concat_text())
+                .unwrap_or_default();
+            let checked = check.validate(&response, &check_output_format).await;
+            if result.is_ok() {
+                result = checked;
+            }
+        }
         log_session_completion(&session, session_start, session_type, result.is_ok()).await;
         result
     } else {

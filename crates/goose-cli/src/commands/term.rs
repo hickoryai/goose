@@ -56,7 +56,7 @@ fi{command_not_found_handler}"#,
         r#"
 
 command_not_found_handle() {
-    echo "🪿 Command '$1' not found. Asking goose..."
+    echo "🌱 Command '$1' not found. Asking kory..."
     '{goose_bin}' term run "$@"
     return 0
 }"#,
@@ -80,7 +80,7 @@ add-zsh-hook preexec goose_preexec{command_not_found_handler}"#,
         r#"
 
 command_not_found_handler() {
-    echo "🪿 Command '$1' not found. Asking goose..."
+    echo "🌱 Command '$1' not found. Asking kory..."
     '{goose_bin}' term run "$@"
     return 0
 }"#,
@@ -129,7 +129,7 @@ if (($env | get -o GOOSE_NU_PREEXEC_INSTALLED | default false) != true) {
         r#"
 $env.config.hooks.command_not_found = {|command_name|
     let prompt = (try { commandline | str trim } catch { $command_name })
-    print $"🪿 Command '($command_name)' not found. Asking goose..."
+    print $"🌱 Command '($command_name)' not found. Asking kory..."
     run-external "{goose_bin}" "term" "run" $prompt | complete | ignore
     null
 }"#,

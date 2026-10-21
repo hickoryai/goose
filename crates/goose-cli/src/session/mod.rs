@@ -6,11 +6,16 @@ mod elicitation;
 mod input;
 mod output;
 mod paste;
+mod program_status;
+mod router_notices;
+mod shutdown;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
+mod tool_calls;
 mod unsolicited;
 
+use crate::session::program_status::{BlockedKind, ProgramStatus};
 use crate::session::task_execution_display::{
     format_task_execution_notification, TASK_EXECUTION_NOTIFICATION_TYPE,
 };
@@ -68,6 +73,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const SHELL_STATUS_FALLBACK_WIDTH: usize = 120;
+/// How often a message the running turn declined is offered to it again.
+const STEER_RETRY: Duration = Duration::from_secs(2);
+/// How long a turn that ended waits for a message on its way to it.
+const STEER_SETTLE: Duration = Duration::from_secs(5);
+/// How long a message may be on its way to the running turn before it counts as declined.
+const STEER_TIMEOUT: Duration = Duration::from_secs(30);
 const SHELL_STATUS_MAX_LINES: usize = 3;
 const SHELL_STATUS_RESERVED_WIDTH: usize = 2;
 
@@ -253,9 +264,12 @@ pub struct CliSession {
     loading_announced: bool,
     /// Records (and at the prompt, shows) what the agent says while no turn of ours runs.
     unsolicited: Option<unsolicited::UnsolicitedRelay>,
-    /// Prints router-acp planner workers' status at the prompt: the router session it
-    /// watches and the watcher.
-    router_status: Option<(String, AbortOnDropHandle<()>)>,
+    /// The persistent child list under the prompt, and the router session it follows.
+    dock: Option<(Option<String>, child_sessions::dock::Dock)>,
+    /// A `/shutdown` router-acp accepted: draining, or done.
+    /// (Behind a lock so a running turn, which holds the agent's stream, can start one.)
+    shutdown: std::sync::Mutex<Option<shutdown::Run>>,
+    planner_auto: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +288,7 @@ pub struct CompletionCache {
     pub current_session_provider: String,
     pub last_updated: Instant,
     pub hint_status: HintStatus,
+    pub planner_quit: Option<shutdown::QuitGuard>,
 }
 
 impl CompletionCache {
@@ -286,6 +301,7 @@ impl CompletionCache {
             current_session_provider: String::new(),
             last_updated: Instant::now(),
             hint_status: HintStatus::Default,
+            planner_quit: None,
         }
     }
 }
@@ -341,7 +357,9 @@ impl CliSession {
             extension_loading,
             loading_announced: false,
             unsolicited: None,
-            router_status: None,
+            dock: None,
+            shutdown: std::sync::Mutex::new(None),
+            planner_auto: false,
         }
     }
 
@@ -556,6 +574,9 @@ impl CliSession {
         cancel_token: CancellationToken,
         interactive: bool,
     ) -> Result<()> {
+        // Typing may start as soon as the message is sent; keep it off the output until the
+        // turn's footer input reads it.
+        let _quiet = self.dock().and_then(|_| child_sessions::EchoOff::start());
         self.ensure_extensions_loaded(interactive).await?;
         let cancel_token = cancel_token.clone();
         self.sync_unsolicited(None).await;
@@ -572,6 +593,7 @@ impl CliSession {
         if !banners.is_empty() {
             output::display_banner(&banners);
         }
+        program_status::enable(self.output_format == "text");
 
         let result = self.run_interactive(prompt).await;
 
@@ -580,17 +602,22 @@ impl CliSession {
             .await;
 
         if result.is_ok() {
+            program_status::report(ProgramStatus::Clear, None);
             println!(
                 "\n  {} {}",
                 console::style("●").red(),
                 console::style(format!("session closed · {}", self.session_id)).dim()
             );
+        } else {
+            program_status::report(ProgramStatus::Error, None);
         }
+        program_status::disable();
 
         result
     }
 
     async fn run_interactive(&mut self, prompt: Option<String>) -> Result<()> {
+        self.enforce_planner_mode().await?;
         if let Some(prompt) = prompt {
             let msg = Message::user().with_text(&prompt);
             self.process_message(msg, CancellationToken::default(), true)
@@ -612,6 +639,9 @@ impl CliSession {
         let history_manager = HistoryManager::new();
         history_manager.load(&mut editor);
 
+        // The status line prints once per prompt; coming back from the dock or the tool-call
+        // list returns to the same prompt, so it is not printed again.
+        let mut show_status = true;
         loop {
             if self
                 .extension_loading
@@ -621,8 +651,25 @@ impl CliSession {
                 self.ensure_extensions_loaded(true).await?;
             }
 
-            self.display_context_usage().await?;
+            if show_status {
+                self.display_context_usage().await?;
+            }
+            show_status = true;
             self.sync_unsolicited(Some(&mut editor)).await;
+            // A `/shutdown` still draining holds the prompt back until it ends.
+            if self.shutdown_gate() == shutdown::Gate::Draining {
+                if let Some(dock) = self.dock() {
+                    dock.end_turn();
+                }
+                if self.wait_for_shutdown().await {
+                    break;
+                }
+                continue;
+            }
+            let queued = self.dock().and_then(|dock| {
+                dock.end_turn();
+                dock.take_queued()
+            });
 
             let conversation_strings: Vec<String> = self
                 .messages
@@ -637,14 +684,67 @@ impl CliSession {
                 })
                 .collect();
 
+            // Messages typed during the last turn go out as soon as it ends.
+            if let Some(queued) = queued {
+                println!("{} {}", console::style(">").cyan(), queued);
+                self.handle_input(
+                    InputResult::Message(queued),
+                    &history_manager,
+                    &mut editor,
+                    &conversation_strings,
+                )
+                .await?;
+                continue;
+            }
+
             output::run_status_hook("waiting");
+            program_status::report_idle();
+            if shutdown::is_planner_session(self.messages.messages())
+                && self.router_session_id().await.is_some()
+            {
+                self.completion_cache
+                    .write()
+                    .unwrap()
+                    .planner_quit
+                    .get_or_insert_with(Default::default);
+            }
+            tool_calls::set_available(tool_calls::has_tool_calls(self.messages.messages()));
             let input = input::get_input(
                 &mut editor,
                 Some(&conversation_strings),
                 self.unsolicited.as_ref(),
             )?;
-            if matches!(input, InputResult::Exit) {
+            if matches!(input, InputResult::Interrupt) {
+                let step = self
+                    .completion_cache
+                    .write()
+                    .unwrap()
+                    .planner_quit
+                    .as_mut()
+                    .map(shutdown::QuitGuard::press);
+                if step == Some(shutdown::QuitStep::Confirm) {
+                    output::print_status_line(shutdown::QUIT_CONFIRM);
+                    show_status = false;
+                    continue;
+                }
+                self.warn_planner_exit().await;
                 break;
+            }
+            if matches!(input, InputResult::Exit) {
+                self.warn_planner_exit().await;
+                break;
+            }
+            // New instructions break the consecutive Ctrl-C sequence.
+            if matches!(input, InputResult::Message(_)) {
+                if let Some(guard) = self.completion_cache.write().unwrap().planner_quit.as_mut() {
+                    *guard = Default::default();
+                }
+            }
+            if matches!(input, InputResult::DockFocus | InputResult::ToolFocus) {
+                // The line editor accepted the empty line to hand over the keys; take that
+                // line back so the prompt returns where it was.
+                erase_accepted_prompt_line();
+                show_status = false;
             }
             self.handle_input(input, &history_manager, &mut editor, &conversation_strings)
                 .await?;
@@ -683,10 +783,18 @@ impl CliSession {
         // here until background extension loading has finished.
         self.ensure_extensions_loaded(true).await?;
         match input {
+            InputResult::Message(_) if self.shutdown_gate() != shutdown::Gate::Open => {
+                if let Some(notice) = self.shutdown_gate().notice() {
+                    output::print_status_line(notice);
+                }
+            }
             InputResult::Message(content) => {
                 self.handle_message_input(&content, history, editor).await?;
             }
-            InputResult::Exit => unreachable!("Exit is handled in the main loop"),
+            InputResult::Shutdown => self.start_shutdown().await,
+            InputResult::Exit | InputResult::Interrupt => {
+                unreachable!("Exit is handled in the main loop")
+            }
             InputResult::AddExtension(cmd) => {
                 history.save(editor);
                 match self.add_extension(cmd.clone()).await {
@@ -749,6 +857,8 @@ impl CliSession {
                 history.save(editor);
                 self.child_navigator(true).await.browse().await;
             }
+            InputResult::DockFocus => self.focus_dock().await,
+            InputResult::ToolFocus => self.browse_tool_calls().await,
             InputResult::Edit(prefill) => {
                 history.save(editor);
                 match crate::session::editor::resolve_editor_command() {
@@ -889,6 +999,10 @@ impl CliSession {
                 return Ok(());
             }
         };
+        if self.planner_auto && mode != GooseMode::Auto {
+            output::goose_mode_message("Planner sessions stay in Auto mode for their lifetime.");
+            return Ok(());
+        }
         self.agent.update_goose_mode(mode, &self.session_id).await?;
         config.set_goose_mode(mode)?;
         output::goose_mode_message(&format!("Goose mode set to '{mode}'"));
@@ -1319,13 +1433,40 @@ impl CliSession {
         Ok(())
     }
 
+    async fn enforce_planner_mode(&mut self) -> Result<()> {
+        if !self.planner_auto && !shutdown::is_planner_session(self.messages.messages()) {
+            return Ok(());
+        }
+        if self.agent.provider(&self.session_id).await?.get_name() != "router-acp" {
+            return Ok(());
+        }
+        let current = self.agent.goose_mode(&self.session_id).await?;
+        let mode =
+            shutdown::planner_mode(&mut self.planner_auto, self.messages.messages(), current);
+        if current != mode {
+            // Updates both ACP's permission decision and the persisted session;
+            // the global config continues to govern ordinary sessions.
+            self.agent.update_goose_mode(mode, &self.session_id).await?;
+            output::goose_mode_message(shutdown::AUTO_MODE_NOTICE);
+        }
+        Ok(())
+    }
+
     async fn process_agent_response(
         &mut self,
         interactive: bool,
         cancel_token: CancellationToken,
     ) -> Result<()> {
+        self.enforce_planner_mode().await?;
         let is_json_mode = self.output_format == "json";
         let is_stream_json_mode = self.output_format == "stream-json";
+
+        // A command-line prompt starts its turn before the interactive prompt creates a
+        // dock. Open the provider first so its router session is known on that first turn.
+        if interactive && !is_json_mode && !is_stream_json_mode {
+            let _provider = self.agent.provider(&self.session_id).await?;
+            self.sync_dock(true).await;
+        }
 
         let session_config = SessionConfig {
             id: self.session_id.clone(),
@@ -1337,13 +1478,17 @@ impl CliSession {
             .last()
             .ok_or_else(|| anyhow::anyhow!("No user message"))?;
         let cancel_token_interrupt = cancel_token.clone();
+        let interrupted_at = Arc::new(std::sync::Mutex::new(None));
+        let signal_time = interrupted_at.clone();
         let handle = tokio::spawn(async move {
             if ctrl_c().await.is_ok() {
+                *signal_time.lock().unwrap() = Some(Instant::now());
                 cancel_token_interrupt.cancel();
             }
         });
         let _drop_handle = AbortOnDropHandle::new(handle);
 
+        program_status::report(ProgramStatus::Working, None);
         let mut stream = self
             .agent
             .reply(
@@ -1362,16 +1507,132 @@ impl CliSession {
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
         let mut stream_error = None;
+        let mut input_failed = false;
         let mut children = self
             .child_navigator(interactive && !is_json_mode && !is_stream_json_mode)
             .await;
+        // Typing during the turn: the footer's input line takes keys, and Ctrl+Enter is only
+        // reported once the terminal's extended keyboard reporting is on.
+        let mut extended_keys = None;
+        if let Some(dock) = self.dock() {
+            dock.begin_turn();
+            children.listen_for_input();
+            extended_keys = child_sessions::dock::ExtendedKeys::enable();
+        }
         let mut deferred_messages: Vec<Message> = Vec::new();
         let mut refresh_children = tokio::time::interval(child_sessions::REFRESH_INTERVAL);
+        // Messages queued in the footer reach the running turn one at a time.
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut steer_retry = tokio::time::interval(STEER_RETRY);
+        let mut handed_to_goose: Vec<String> = Vec::new();
+        // ↑ from the input line with nothing queued: the session's tool calls, full screen.
+        let mut tool_view: Option<tool_calls::ToolCallsView> = None;
+        // A `/shutdown`'s progress, and its lines held while a full-screen view is open.
+        let mut shutdown_rx = self.take_shutdown_notifications();
+        let mut held_status: Vec<String> = Vec::new();
 
         use futures::StreamExt;
         loop {
             tokio::select! {
                 key = children.next_key() => {
+                    // The tool-call list, while open, takes every key but Ctrl-C.
+                    if let Some(view) = tool_view.as_mut() {
+                        if key == child_sessions::Key::Interrupt {
+                            cancel_token_clone.cancel();
+                        } else if !view.key(key) {
+                            tool_view = None;
+                            print_held_status(&mut held_status);
+                            render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                        }
+                        continue;
+                    }
+                    // Enter on the input line: `/shutdown` goes to router-acp rather than the
+                    // queue, and nothing else is sent while a shutdown is under way.
+                    let typed = (!children.is_open()
+                        && matches!(key, child_sessions::Key::Enter | child_sessions::Key::SendNow))
+                    .then(|| self.dock().filter(|dock| !dock.is_selecting()).map(|dock| dock.input_text()))
+                    .flatten()
+                    .filter(|text| !text.trim().is_empty());
+                    if let Some(text) = typed {
+                        let gate = self.shutdown_gate();
+                        if text.trim() == "/shutdown" || gate != shutdown::Gate::Open {
+                            output::hide_thinking();
+                            let _ = progress_bars.hide();
+                            match gate.notice() {
+                                // The text stays in the input line.
+                                Some(notice) => output::print_status_line(notice),
+                                None => {
+                                    if let Some(dock) = self.dock() {
+                                        dock.clear_input();
+                                    }
+                                    self.start_shutdown().await;
+                                    if shutdown_rx.is_none() {
+                                        shutdown_rx = self.take_shutdown_notifications();
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // With the navigator closed, keys drive the footer: arrows, Enter and clicks
+                    // the dock; everything else the input line.
+                    if !children.is_open() {
+                        if let Some(dock) = self.dock() {
+                            use child_sessions::Key;
+                            let chosen = match key {
+                                Key::Interrupt => {
+                                    cancel_token_clone.cancel();
+                                    None
+                                }
+                                Key::Open => {
+                                    children.handle_key(key, true).await;
+                                    None
+                                }
+                                Key::Up if dock.is_selecting() => {
+                                    dock.step(-1);
+                                    None
+                                }
+                                // Nothing queued to take back: ↑ moves into the tool calls.
+                                Key::Up if !dock.has_queued() => {
+                                    let calls = tool_calls::collect(self.messages.messages());
+                                    if !calls.is_empty() {
+                                        output::hide_thinking();
+                                        let _ = progress_bars.hide();
+                                        tool_view = tool_calls::ToolCallsView::open(calls);
+                                    }
+                                    None
+                                }
+                                Key::Down if dock.has_rows() => {
+                                    dock.step(1);
+                                    None
+                                }
+                                Key::Enter if dock.is_selecting() => dock.selected(),
+                                Key::Escape if dock.is_selecting() => {
+                                    dock.clear_selection();
+                                    None
+                                }
+                                Key::Click { row, .. } => dock.select_row(row),
+                                key => {
+                                    match dock.type_key(key) {
+                                        child_sessions::dock::Typed::SendNow => {
+                                            cancel_token_clone.cancel()
+                                        }
+                                        child_sessions::dock::Typed::Queued => {
+                                            self.start_steer(&steer_tx)
+                                        }
+                                        _ => {}
+                                    }
+                                    None
+                                }
+                            };
+                            if let Some(child) = chosen {
+                                output::hide_thinking();
+                                let _ = progress_bars.hide();
+                                children.open_at(&child, true).await;
+                            }
+                            continue;
+                        }
+                    }
                     let was_open = children.is_open();
                     if !was_open {
                         output::hide_thinking();
@@ -1379,8 +1640,39 @@ impl CliSession {
                     }
                     children.handle_key(key, true).await;
                     if was_open && !children.is_open() {
+                        print_held_status(&mut held_status);
                         render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                     }
+                }
+                notification = shutdown::next_notification(&mut shutdown_rx) => {
+                    let lines = self.take_shutdown_progress(&notification);
+                    if children.is_open() || tool_view.is_some() {
+                        held_status.extend(lines);
+                    } else if !lines.is_empty() {
+                        output::hide_thinking();
+                        let _ = progress_bars.hide();
+                        held_status.extend(lines);
+                        print_held_status(&mut held_status);
+                    }
+                }
+                Some((text, outcome)) = steer_rx.recv() => {
+                    let Some(dock) = self.dock() else { continue };
+                    let (delivered, echo) = settle_steer(dock, text, outcome, &mut handed_to_goose);
+                    if let Some(echo) = &echo {
+                        if children.is_open() || tool_view.is_some() {
+                            deferred_messages.push(echo.clone());
+                        } else {
+                            output::hide_thinking();
+                            let _ = progress_bars.hide();
+                            output::render_message_streaming(echo, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                        }
+                    }
+                    if delivered {
+                        self.start_steer(&steer_tx);
+                    }
+                }
+                _ = steer_retry.tick(), if self.dock().is_some_and(|dock| dock.has_queued()) => {
+                    self.start_steer(&steer_tx);
                 }
                 _ = refresh_children.tick(), if children.is_open() || children.watches_router() => {
                     if children.is_open() {
@@ -1399,18 +1691,25 @@ impl CliSession {
                                 || find_elicitation_request(&message).is_some()
                                 || output::get_credits_top_up_url(&message).is_some();
                             if needs_terminal {
+                                drop(extended_keys.take());
+                                tool_view = None;
                                 children.suspend();
                                 render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                             }
                             if let Some(confirmation_request) = find_tool_confirmation(&message) {
                                 let selected_permission = if interactive {
-                                    prompt_tool_confirmation(&confirmation_request)?
+                                    program_status::report(
+                                        ProgramStatus::Blocked(BlockedKind::Permission),
+                                        Some(&confirmation_request.tool_name),
+                                    );
+                                    let permission = prompt_tool_confirmation(&confirmation_request)?;
+                                    program_status::report(ProgramStatus::Working, None);
+                                    permission
                                 } else {
                                     // Non-interactive/headless mode: refuse to run in
                                     // Approve/SmartApprove modes since auto-allowing would
                                     // bypass the safety contract those modes are meant to enforce.
-                                    let config = Config::global();
-                                    let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
+                                    let goose_mode = self.agent.goose_mode(&self.session_id).await?;
                                     if goose_mode == GooseMode::Approve || goose_mode == GooseMode::SmartApprove {
                                         cancel_token_clone.cancel();
                                         drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
@@ -1477,8 +1776,13 @@ impl CliSession {
                                 output::hide_thinking();
                                 let _ = progress_bars.hide();
 
+                                program_status::report(
+                                    ProgramStatus::Blocked(BlockedKind::Question),
+                                    Some(&elicitation_message),
+                                );
                                 match elicitation::collect_elicitation_input(&elicitation_message, &schema, &cancel_token_clone) {
                                     Ok(input) => {
+                                        program_status::report(ProgramStatus::Working, None);
                                         match &input.action {
                                             ElicitationAction::Decline => {
                                                 output::render_text("Information request declined.", Some(Color::Yellow), true);
@@ -1513,6 +1817,7 @@ impl CliSession {
                                     }
                                     Err(e) => {
                                         output::render_error(&format!("Failed to collect input: {}", e));
+                                        input_failed = true;
                                         cancel_token_clone.cancel();
                                         drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
                                         break;
@@ -1528,6 +1833,9 @@ impl CliSession {
 
                                 if is_stream_json_mode {
                                     emit_stream_event(&StreamEvent::Message { message: message.clone() });
+                                } else if let Some(view) = tool_view.as_mut() {
+                                    view.refresh(tool_calls::collect(self.messages.messages()));
+                                    deferred_messages.push(message);
                                 } else if children.is_open() {
                                     deferred_messages.push(message);
                                 } else if !is_json_mode {
@@ -1544,7 +1852,8 @@ impl CliSession {
                             last_usage = Some(usage);
                         }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}
-                        Some(Ok(AgentEvent::McpNotification(_))) if children.is_open() => {}
+                        Some(Ok(AgentEvent::McpNotification(_)))
+                            if children.is_open() || tool_view.is_some() => {}
                         Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
                             handle_mcp_notification(
                                 &extension_id,
@@ -1560,6 +1869,7 @@ impl CliSession {
                             self.messages = updated_conversation;
                         }
                         Some(Err(e)) => {
+                            tool_view = None;
                             children.suspend();
                             render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                             if interactive || !is_stream_json_mode {
@@ -1584,6 +1894,7 @@ impl CliSession {
                     }
                 }
                 _ = cancel_token_clone.cancelled() => {
+                    tool_view = None;
                     children.suspend();
                     render_deferred(&mut deferred_messages, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
                     drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
@@ -1595,7 +1906,32 @@ impl CliSession {
                 }
             }
         }
+        drop(tool_view);
         drop(children);
+        print_held_status(&mut held_status);
+        self.return_shutdown_notifications(shutdown_rx);
+        if let Some(dock) = self.dock() {
+            if dock.is_steering() {
+                match tokio::time::timeout(STEER_SETTLE, steer_rx.recv()).await {
+                    Ok(Some((text, outcome))) => {
+                        deferred_messages
+                            .extend(settle_steer(dock, text, outcome, &mut handed_to_goose).1);
+                    }
+                    _ => dock.finish_steer(false),
+                }
+            }
+            // Messages goose's loop never got to add go out with the rest after the turn.
+            handed_to_goose.retain(|text| {
+                !self
+                    .messages
+                    .iter()
+                    .any(|message| message.metadata.steer && message.as_concat_text() == *text)
+            });
+            if !handed_to_goose.is_empty() {
+                self.agent.discard_pending_steers(&self.session_id).await;
+                dock.requeue(handed_to_goose);
+            }
+        }
         render_deferred(
             &mut deferred_messages,
             &mut markdown_buffer,
@@ -1603,6 +1939,12 @@ impl CliSession {
             self.debug,
         );
 
+        let failed = input_failed
+            || stream_error.is_some()
+            || self
+                .messages
+                .last()
+                .is_some_and(|message| message.error_kind().is_some());
         let terminal_error = headless_run_error(
             interactive,
             cancel_token_clone.is_cancelled(),
@@ -1700,7 +2042,34 @@ impl CliSession {
         }
 
         if interactive {
+            let signal_time = *interrupted_at.lock().unwrap();
+            if let Some(at) = signal_time {
+                if shutdown::is_planner_session(self.messages.messages())
+                    && self.router_session_id().await.is_some()
+                {
+                    {
+                        let mut cache = self.completion_cache.write().unwrap();
+                        cache
+                            .planner_quit
+                            .get_or_insert_with(Default::default)
+                            .press_at(at);
+                        cache.hint_status = HintStatus::MaybeExit;
+                    }
+                    let census = self.planner_census().await;
+                    output::print_status_line(&census.interrupted_line());
+                }
+            }
             output::emit_attention_bell();
+            program_status::report(
+                if failed {
+                    ProgramStatus::Error
+                } else if cancel_token_clone.is_cancelled() {
+                    ProgramStatus::Idle
+                } else {
+                    ProgramStatus::Done
+                },
+                None,
+            );
         }
 
         if let Some(error) = terminal_error {
@@ -1977,9 +2346,13 @@ impl CliSession {
 
         match self.get_session().await {
             Ok(metadata) => {
-                let total_tokens = metadata.usage.total_tokens.unwrap_or(0) as usize;
-
-                output::display_context_usage(total_tokens, context_limit);
+                if let Some(used) = context_in_use(
+                    provider.context_tokens(),
+                    provider.manages_own_context(),
+                    metadata.usage.total_tokens,
+                ) {
+                    output::display_context_usage(used, context_limit);
+                }
 
                 if show_cost {
                     output::display_cost_usage(
@@ -1990,7 +2363,13 @@ impl CliSession {
                 }
             }
             Err(_) => {
-                output::display_context_usage(0, context_limit);
+                if let Some(used) = context_in_use(
+                    provider.context_tokens(),
+                    provider.manages_own_context(),
+                    Some(0),
+                ) {
+                    output::display_context_usage(used, context_limit);
+                }
             }
         }
 
@@ -2081,6 +2460,9 @@ impl CliSession {
         &mut self,
         editor: Option<&mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>>,
     ) {
+        // Only the interactive prompt (which passes its editor) decides the footer; a turn
+        // started from it calls this without one and must keep it.
+        let at_prompt = editor.is_some();
         let session_manager = self.agent.config.session_manager.clone();
         let provider = match session_manager.get_session(&self.session_id, false).await {
             Ok(session) => self.agent.config.providers.pinned(&session).await,
@@ -2093,7 +2475,7 @@ impl CliSession {
                 .is_some_and(|provider| relay.follows(provider, &self.session_id))
                 && (display.is_none() || relay.displays())
         });
-        let replaced = !current && provider.is_some();
+        let interactive = display.is_some();
         if let (false, Some(provider)) = (current, provider) {
             if let Some(previous) = self.unsolicited.take() {
                 previous.settle().await;
@@ -2115,39 +2497,276 @@ impl CliSession {
             );
         }
         self.take_unsolicited();
-        self.sync_router_status(replaced).await;
+        if at_prompt {
+            self.sync_dock(interactive).await;
+        }
     }
 
-    /// Keeps the prompt-time worker status following the router session this goose session
-    /// runs in, printed through the background-output relay.
-    async fn sync_router_status(&mut self, relay_replaced: bool) {
-        let notifier = self
-            .unsolicited
-            .as_ref()
-            .filter(|relay| relay.displays())
-            .map(|relay| relay.notifier());
-        let root = match notifier {
-            Some(_) => self.router_session_id().await,
-            None => None,
-        };
-        let (Some(notifier), Some(root)) = (notifier, root) else {
-            self.router_status = None;
-            return;
-        };
-        if !relay_replaced
-            && self
-                .router_status
-                .as_ref()
-                .is_some_and(|(id, _)| *id == root)
-        {
+    /// Keeps the child dock following the router session this goose session runs in. Only an
+    /// interactive text prompt has one.
+    async fn sync_dock(&mut self, interactive: bool) {
+        if !interactive || !child_sessions::dock::is_capable() {
+            self.dock = None;
             return;
         }
-        self.router_status = RouterStateSource::configured().ok().map(|source| {
-            let watch = child_sessions::router::watch_status(source, root.clone(), move |line| {
-                notifier.notice(console::style(line).dim().to_string())
-            });
-            (root, watch)
+        let root = self.router_session_id().await;
+        if self.dock.as_ref().is_some_and(|(id, _)| *id == root) {
+            return;
+        }
+        self.dock = None;
+        let router = root.clone().and_then(|id| {
+            RouterStateSource::configured()
+                .ok()
+                .map(|source| (source, id))
         });
+        let dock = child_sessions::dock::Dock::start(child_sessions::dock::Sources {
+            session_manager: self.agent.config.session_manager.clone(),
+            session_id: self.session_id.clone(),
+            router,
+        });
+        self.dock = Some((root, dock));
+    }
+
+    fn dock(&self) -> Option<&child_sessions::dock::Dock> {
+        self.dock.as_ref().map(|(_, dock)| dock)
+    }
+
+    /// Hands the footer's oldest queued message to the running turn, unless one is on its way;
+    /// the outcome arrives on `outcomes`.
+    fn start_steer(
+        &self,
+        outcomes: &tokio::sync::mpsc::UnboundedSender<(
+            String,
+            Result<goose::providers::base::SteerOutcome>,
+        )>,
+    ) {
+        let Some(text) = self.dock().and_then(|dock| dock.next_steer()) else {
+            return;
+        };
+        let (agent, session_id, outcomes) = (
+            self.agent.clone(),
+            self.session_id.clone(),
+            outcomes.clone(),
+        );
+        tokio::spawn(async move {
+            // A turn that never answers must not hold up the messages queued behind this one.
+            let outcome =
+                tokio::time::timeout(STEER_TIMEOUT, agent.steer_running_turn(&session_id, &text))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("no answer to the steer in time")));
+            let _ = outcomes.send((text, outcome));
+        });
+    }
+
+    /// ↑ on an empty prompt: the session's tool calls, full screen, until ↓ past the newest,
+    /// Esc or q returns to the prompt.
+    async fn browse_tool_calls(&mut self) {
+        let calls = tool_calls::collect(self.messages.messages());
+        let Ok(mut keys) = child_sessions::KeyReader::start() else {
+            return;
+        };
+        let Some(mut view) = tool_calls::ToolCallsView::open(calls) else {
+            return;
+        };
+        while let Some(key) = keys.next().await {
+            if !view.key(key) {
+                break;
+            }
+        }
+    }
+
+    fn shutdown_gate(&self) -> shutdown::Gate {
+        shutdown::Gate::of(self.shutdown.lock().unwrap().as_ref())
+    }
+
+    async fn planner_census(&self) -> shutdown::Census {
+        match self.agent.provider(&self.session_id).await {
+            Ok(provider) => shutdown::census(provider.as_ref()).await,
+            Err(_) => shutdown::Census::default(),
+        }
+    }
+
+    async fn warn_planner_exit(&self) {
+        let draining = self.shutdown_gate() == shutdown::Gate::Draining;
+        if draining
+            || (shutdown::is_planner_session(self.messages.messages())
+                && self.router_session_id().await.is_some())
+        {
+            if let Some(line) = self.planner_census().await.exit_warning(draining) {
+                output::print_status_line(line);
+            }
+        }
+    }
+
+    fn take_shutdown_notifications(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<goose::providers::base::ExtensionNotification>>
+    {
+        self.shutdown
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|run| run.notifications.take())
+    }
+
+    fn return_shutdown_notifications(
+        &self,
+        notifications: Option<
+            tokio::sync::broadcast::Receiver<goose::providers::base::ExtensionNotification>,
+        >,
+    ) {
+        if let Some(run) = self.shutdown.lock().unwrap().as_mut() {
+            if run.notifications.is_none() {
+                run.notifications = notifications;
+            }
+        }
+    }
+
+    /// `/shutdown`: router-acp saves the planner run's resume state and drains its workers.
+    /// Refused here outside an `/implement` (planner) session; router-acp may refuse too.
+    async fn start_shutdown(&self) {
+        if let Some(notice) = self.shutdown_gate().notice() {
+            output::print_status_line(notice);
+            return;
+        }
+        if self.router_session_id().await.is_none()
+            || !shutdown::is_planner_session(self.messages.messages())
+        {
+            output::print_status_line(shutdown::REFUSED);
+            return;
+        }
+        let provider = match self.agent.provider(&self.session_id).await {
+            Ok(provider) => provider,
+            Err(error) => {
+                output::print_status_line(&format!("◼ shutdown · refused: {error}"));
+                return;
+            }
+        };
+        let Some(session_id) = provider.provider_session_id() else {
+            output::print_status_line(shutdown::REFUSED);
+            return;
+        };
+        match shutdown::request(provider.as_ref()).await {
+            Ok(notifications) => {
+                *self.shutdown.lock().unwrap() = Some(shutdown::Run {
+                    session_id,
+                    notifications,
+                    drained: false,
+                });
+                if let Some(dock) = self.dock() {
+                    dock.set_status(Some("shutting down".to_string()));
+                }
+            }
+            Err(error) => output::print_status_line(&format!("◼ shutdown · refused: {error}")),
+        }
+    }
+
+    /// Applies one progress notification of the running shutdown, returning the lines to
+    /// print for it (none for another session's or another kind of notification).
+    fn take_shutdown_progress(
+        &self,
+        notification: &goose::providers::base::ExtensionNotification,
+    ) -> Vec<String> {
+        let (progress, lines) = {
+            let mut guard = self.shutdown.lock().unwrap();
+            let Some(run) = guard.as_mut() else {
+                return Vec::new();
+            };
+            let Some(progress) = shutdown::parse(notification, &run.session_id) else {
+                return Vec::new();
+            };
+            let mut lines = vec![shutdown::line(&progress)];
+            match progress.phase {
+                shutdown::Phase::Drained => {
+                    run.drained = true;
+                    lines.push(shutdown::CLOSE_HINT.to_string());
+                }
+                shutdown::Phase::Failed => *guard = None,
+                _ => {}
+            }
+            (progress, lines)
+        };
+        if let Some(dock) = self.dock() {
+            dock.set_status(shutdown::footer(&progress));
+        }
+        lines
+    }
+
+    /// Between turns while the workers drain: no prompt, the progress as it comes, Enter says
+    /// why, and Ctrl-C twice quits. True when the operator quit.
+    async fn wait_for_shutdown(&self) -> bool {
+        let mut notifications = self.take_shutdown_notifications();
+        let mut keys = child_sessions::KeyReader::start().ok();
+        let mut quit = shutdown::QuitGuard::default();
+        output::print_status_line(shutdown::BLOCKED);
+        let quitting = loop {
+            tokio::select! {
+                notification = shutdown::next_notification(&mut notifications) => {
+                    for line in self.take_shutdown_progress(&notification) {
+                        output::print_status_line(&line);
+                    }
+                    if self.shutdown_gate() != shutdown::Gate::Draining {
+                        break false;
+                    }
+                }
+                key = next_key(&mut keys) => {
+                    if matches!(key, child_sessions::Key::Enter | child_sessions::Key::SendNow) {
+                        output::print_status_line(shutdown::BLOCKED);
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => match quit.press() {
+                    shutdown::QuitStep::Confirm => output::print_status_line(shutdown::QUIT_CONFIRM),
+                    shutdown::QuitStep::Quit => {
+                        output::print_status_line(shutdown::EXIT_WARNING);
+                        break true;
+                    }
+                },
+            }
+        };
+        self.return_shutdown_notifications(notifications);
+        quitting
+    }
+
+    /// ↓ on an empty prompt: ↑/↓ choose a child, Enter (or a click) opens it in the
+    /// navigator, Esc or ↑ past the first row returns to the prompt.
+    async fn focus_dock(&mut self) {
+        let Some(dock) = self.dock() else {
+            return;
+        };
+        if !dock.step(1) {
+            return;
+        }
+        let mut navigator = self.child_navigator(true).await;
+        let Ok(mut keys) = child_sessions::KeyReader::start() else {
+            dock.clear_selection();
+            return;
+        };
+        while let Some(key) = keys.next().await {
+            let Some(dock) = self.dock() else { break };
+            let chosen = match key {
+                child_sessions::Key::Up if !dock.step(-1) => break,
+                child_sessions::Key::Up => None,
+                child_sessions::Key::Down => {
+                    dock.step(1);
+                    None
+                }
+                child_sessions::Key::Enter => dock.selected(),
+                child_sessions::Key::Click { row, .. } => dock.select_row(row),
+                child_sessions::Key::Escape | child_sessions::Key::Char('q') => break,
+                _ => None,
+            };
+            if let Some(child) = chosen {
+                drop(keys);
+                navigator.browse_at(&child).await;
+                keys = match child_sessions::KeyReader::start() {
+                    Ok(keys) => keys,
+                    Err(_) => break,
+                };
+            }
+        }
+        if let Some(dock) = self.dock() {
+            dock.clear_selection();
+        }
     }
 
     /// The navigator over this session's children, including the delegates router-acp runs
@@ -2299,6 +2918,60 @@ async fn drain_stopped_run(
             Ok(AgentEvent::Usage(usage)) => *last_usage = Some(usage),
             _ => {}
         }
+    }
+}
+
+/// Records what became of a message handed to the running turn: whether it was delivered,
+/// and the message to show when the turn took it directly. One goose's loop took shows when
+/// the loop adds it.
+fn settle_steer(
+    dock: &child_sessions::dock::Dock,
+    text: String,
+    outcome: Result<goose::providers::base::SteerOutcome>,
+    handed_to_goose: &mut Vec<String>,
+) -> (bool, Option<Message>) {
+    use goose::providers::base::SteerOutcome;
+    let settled = match outcome {
+        Ok(SteerOutcome::Injected) => (true, Some(Message::user().with_text(&text).with_steer())),
+        Ok(SteerOutcome::Unsupported) => {
+            handed_to_goose.push(text);
+            (true, None)
+        }
+        Ok(SteerOutcome::Declined) => (false, None),
+        Err(error) => {
+            tracing::warn!(%error, "could not hand a queued message to the running turn");
+            (false, None)
+        }
+    };
+    dock.finish_steer(settled.0);
+    settled
+}
+
+fn print_held_status(lines: &mut Vec<String>) {
+    for line in lines.drain(..) {
+        output::print_status_line(&line);
+    }
+}
+
+/// The next key from `keys`, or never without a reader.
+async fn next_key(keys: &mut Option<child_sessions::KeyReader>) -> child_sessions::Key {
+    loop {
+        match keys.as_mut() {
+            Some(reader) => match reader.next().await {
+                Some(key) => return key,
+                None => *keys = None,
+            },
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Clears the empty `> ` line the line editor left when it handed keys to the dock or the
+/// tool-call list, so returning to the prompt does not stack another one under it.
+fn erase_accepted_prompt_line() {
+    if std::io::stdout().is_terminal() {
+        print!("\x1b[1A\r\x1b[2K");
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -2906,6 +3579,21 @@ fn headless_run_error(
         })
 }
 
+/// Tokens the context holds now. A provider that manages its own context reports this itself
+/// (ACP `usage_update.used`); its turn usage sums every model call of the turn, so it is never
+/// shown as context. For goose's own loop the last call's usage is the context.
+fn context_in_use(
+    reported: Option<usize>,
+    manages_own_context: bool,
+    last_call_total: Option<i32>,
+) -> Option<usize> {
+    match reported {
+        Some(used) => Some(used),
+        None if manages_own_context => None,
+        None => Some(last_call_total.unwrap_or(0).max(0) as usize),
+    }
+}
+
 /// Format elapsed time duration
 /// Shows seconds if less than 60, otherwise shows minutes:seconds
 fn format_elapsed_time(duration: std::time::Duration) -> String {
@@ -2945,6 +3633,20 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use test_case::test_case;
+
+    #[test]
+    fn context_usage_prefers_the_providers_report_over_turn_totals() {
+        // router-acp: 3.3M summed over the turn's model calls, 84k actually in context.
+        assert_eq!(
+            context_in_use(Some(84_000), true, Some(3_300_000)),
+            Some(84_000)
+        );
+        // No report yet from a self-managing provider: the turn total is not context.
+        assert_eq!(context_in_use(None, true, Some(3_300_000)), None);
+        // goose's own loop: the last call's usage is the context.
+        assert_eq!(context_in_use(None, false, Some(12_000)), Some(12_000));
+        assert_eq!(context_in_use(None, false, None), Some(0));
+    }
 
     #[test]
     fn only_headless_terminal_failures_are_propagated() {
@@ -3414,12 +4116,12 @@ mod tests {
         );
     }
 
-    struct StubProvider;
+    struct StubProvider(&'static str);
 
     #[async_trait::async_trait]
     impl Provider for StubProvider {
         fn get_name(&self) -> &str {
-            "stub"
+            self.0
         }
 
         async fn stream(
@@ -3469,7 +4171,7 @@ mod tests {
         ));
         agent
             .update_provider(
-                Arc::new(StubProvider),
+                Arc::new(StubProvider("stub")),
                 goose_providers::model::ModelConfig::new("stub-model"),
                 &session.id,
             )
@@ -3489,6 +4191,39 @@ mod tests {
             extension_loading,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn planner_mode_updates_persisted_session_and_survives_later_operator_turns() {
+        let mut session = session_with_loader(None, false).await;
+        session
+            .agent
+            .update_provider(
+                Arc::new(StubProvider("router-acp")),
+                goose_providers::model::ModelConfig::new("stub-model"),
+                &session.session_id,
+            )
+            .await
+            .unwrap();
+        session
+            .agent
+            .update_goose_mode(GooseMode::Approve, &session.session_id)
+            .await
+            .unwrap();
+        session.push_message(Message::user().with_text("/implement Docs/Plans/X.md"));
+        session.enforce_planner_mode().await.unwrap();
+        assert_eq!(
+            session.agent.goose_mode(&session.session_id).await.unwrap(),
+            GooseMode::Auto
+        );
+        session.handle_goose_mode("approve").await.unwrap();
+        session.messages = Conversation::default();
+        session.push_message(Message::user().with_text("continue the release"));
+        session.enforce_planner_mode().await.unwrap();
+        assert_eq!(
+            session.agent.goose_mode(&session.session_id).await.unwrap(),
+            GooseMode::Auto
+        );
     }
 
     #[tokio::test]

@@ -173,7 +173,7 @@ pub fn configure_telemetry_consent_dialog() -> anyhow::Result<bool> {
     );
     println!(
         "{}",
-        style("This helps us understand how goose is used and identify areas for improvement.")
+        style("This helps us understand how kory is used and identify areas for improvement.")
             .dim()
     );
     println!();
@@ -1492,7 +1492,7 @@ pub async fn configure_settings_dialog() -> anyhow::Result<()> {
         .item(
             "recipe",
             "goose recipe github repo",
-            "goose will pull recipes from this repo if not found locally.",
+            "kory will pull recipes from this repo if not found locally.",
         )
         .interact()?;
 
@@ -1972,7 +1972,7 @@ pub fn configure_max_turns_dialog() -> anyhow::Result<()> {
     config.set_param("GOOSE_MAX_TURNS", max_turns)?;
 
     cliclack::outro(format!(
-        "Set maximum turns to {} - goose will ask for input after {} consecutive actions",
+        "Set maximum turns to {} - kory will ask for input after {} consecutive actions",
         max_turns, max_turns
     ))?;
 

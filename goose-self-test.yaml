@@ -12,9 +12,11 @@ activities:
   - Validate the configurable Databricks AI Gateway path across all inference routes
   - Validate declared vision through persisted custom-provider configuration and outbound requests
   - Analyze code structure and parsing capabilities
+  - Validate Boa JavaScript discovery, batching, cancellation, and isolation
   - Test extension discovery and management
   - Test load tool for knowledge injection and discovery
   - Test delegate tool for task delegation
+  - Validate live child-session model and elapsed-time labels
   - Test multi-turn thinking preservation for providers that reject replayed reasoning_content
   - Test Z.AI Coding Plan streamed tool calls and interruption recovery
   - Validate ACP thinking-effort discovery, forwarding, and provider switching
@@ -28,7 +30,7 @@ parameters:
     input_type: string
     requirement: optional
     default: "all"
-    description: "Which test phases to run: all, basic, extensions, delegation, declared-vision, reasoning, zai-coding-plan, acp-effort, compaction, advanced"
+    description: "Which test phases to run: all, basic, extensions, delegation, code-mode, children-ui, declared-vision, reasoning, zai-coding-plan, acp-effort, compaction, headless-check, advanced"
 
   - key: test_depth
     input_type: string
@@ -71,6 +73,20 @@ instructions: |
   - Document everything meticulously
   - Handle errors gracefully - a test failure shouldn't stop the suite
 
+  When test_phases is headless-check, run only the goose-cli skill_check regression tests
+  using the checkout's existing resource/build launcher. Verify successful validator exit,
+  rejected final results, malformed opt-in metadata, startup errors, literal arguments and
+  bounded validator timeout. Report their actual exit status. Do not run the other phases,
+  delegate work, call external services or interpret a model saying PASS as test evidence.
+
+  When test_phases is children-ui, run only
+  `GOOSE_DISABLE_KEYRING=1 cargo test --release -p goose-cli --lib session::child_sessions`
+  from the checkout after sourcing bin/activate-hermit. Verify that running child rows show
+  their model and elapsed duration, duration advances without new child data, router delegate
+  metadata reaches both the dock and navigator, and completed/failed states remain visible.
+  Report the actual test exit status. Do not run other phases or delegate work. The headless
+  recipe cannot inspect a terminal dock; live terminal behavior requires interactive checking.
+
   ## Test Execution Framework
 
   ### Phase 1: Environment Setup & Basic Tool Validation
@@ -86,6 +102,21 @@ instructions: |
   - Enable/disable extensions
   - Test extension interactions
   - Verify isolation between extensions
+
+  ### Code Mode: Boa Runtime
+  When code mode is enabled (or test_phases is code-mode):
+  - Use list_functions and get_function_details to inspect exact tool names and original JSON schemas.
+  - Use execute_javascript with async function run() and tools.call(name, arguments).
+  - Compare sequential calls and Promise.all batches; verify results and caught tool errors.
+  - Verify unknown names and invalid arguments produce actionable errors.
+  - Verify console output and returned JSON contain only the information requested.
+  - Verify typeof fetch, process, Deno, and require are undefined; imports must fail.
+  - Check cyclic and BigInt return values produce useful errors.
+  - Check infinite loops before and after await, recursive calls, and unresolved promises terminate.
+  - Cancel a script awaiting a long-running tool and verify the tool stops.
+  - Run a normal script afterward and in another session; verify no JavaScript state leaks.
+  - Verify hidden tools cannot be discovered or called and hidden results remain hidden.
+  - Record any permission or mutation checks that require manual interaction.
 
   ### Phase 3: Delegate & Load Testing
   Test the unified delegation and knowledge-loading tools:
@@ -134,6 +165,21 @@ extensions:
 prompt: |
   Execute the Goose Self-Testing Integration Suite in {{ workspace_dir }}.
   Test phases: {{ test_phases }}, Depth: {{ test_depth }}, Parallel: {{ parallel_tests }}
+
+  {% if test_phases == "children-ui" %}
+  Run only `source bin/activate-hermit && GOOSE_DISABLE_KEYRING=1 cargo test --release -p goose-cli --lib session::child_sessions`.
+  Report its actual exit status and test counts, then finish. Do not execute initialization
+  or other phases below, delegate work, or edit source. Check model and elapsed-time rendering,
+  elapsed-time boundaries, router metadata, existing status labels, and terminal width limits.
+  {% endif %}
+
+  {% if test_phases == "headless-check" %}
+  Run only `cargo test --release -p goose-cli --lib skill_check -- --nocapture`
+  through the existing resource/build launcher. Report its actual exit status and test counts,
+  then finish. Do not execute the initialization or other phases below, delegate, edit source,
+  or call external services. The tests must cover validator success, failure, missing executable,
+  timeout, literal arguments, and invalid metadata.
+  {% endif %}
 
   ## 🚀 INITIALIZATION
   Create test workspace using `mkdir -p {{ workspace_dir }}/archive` for all test artifacts and reports.
@@ -217,6 +263,21 @@ prompt: |
 
   Log command results and failures to: {{ workspace_dir }}/compaction.md
   Do not modify source files or configuration to make these checks pass.
+  {% endif %}
+
+  {% if test_phases == "all" or "code-mode" in test_phases %}
+  ## Code Mode: JavaScript Runtime
+  Enable the code_execution extension if necessary. Discover exact names with list_functions
+  and inspect the JSON schemas of two read-only tools with get_function_details.
+  Execute async function run() scripts using tools.call(name, arguments):
+  1. Compare sequential calls with a Promise.all batch and log only a short summary.
+  2. Catch an unknown-tool error and confirm it points back to discovery.
+  3. Check syntax errors, invalid argument objects, cyclic returns, and BigInt returns.
+  4. Check infinite loops before and after await and unresolved promises terminate, then run a normal script.
+  5. Confirm JavaScript globals do not expose filesystem, network, package, or environment APIs.
+  6. Run a second script to confirm globals from the first execution are absent.
+  Record checks requiring external cancellation or a second session as manual follow-up.
+  Log results to: {{ workspace_dir }}/code_mode.md
   {% endif %}
 
   {% if test_phases == "all" or "extensions" in test_phases %}

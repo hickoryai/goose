@@ -19,15 +19,10 @@ use crate::agents::provider_manager::ProviderManager;
 use crate::agents::state_machine::ops_recipe;
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
-    persist_tool_confirmation_decision, run_goose, BangShellOperation, CompactionOperation,
-    DoctorOperation, Emitter, EmptyResponseOperation, ExitOnErrorOperation, GooseEffect,
-    GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation,
-    Operation, ProjectOperation, RecipeOperation, RetryOperation, SkillOperation,
-    SlashCommandOperation, StateMachine, StatusOperation, SteerOperation, SteerQueue, Step,
-    StopHookOperation, SubagentOperation, ToolApprovalOperation, ToolExecutionOperation,
-    ToolPairCompactionOperation, UnknownToolOperation,
+    persist_tool_confirmation_decision, run_goose, Emitter, GooseEffect, StateMachine, SteerQueue,
 };
-use crate::agents::subagent_handler::SubagentRunner;
+use crate::agents::state_machine_builder::{build_state_machine, StateMachineConfig};
+use crate::agents::subagent_handler::ForegroundSubagentRunner;
 use crate::agents::types::{
     SessionConfig, DEFAULT_ON_FAILURE_TIMEOUT_SECONDS, DEFAULT_RETRY_TIMEOUT_SECONDS,
 };
@@ -109,7 +104,6 @@ pub struct AgentConfig {
     pub elicitation_handler: Option<crate::agents::mcp_client::ElicitationHandler>,
     pub mcp_protocol_version: Option<rmcp::model::ProtocolVersion>,
     pub session_name_update_tx: Option<mpsc::UnboundedSender<SessionNameUpdate>>,
-    pub use_login_shell_path: Option<bool>,
     pub providers: Arc<ProviderManager>,
 }
 
@@ -131,7 +125,6 @@ impl AgentConfig {
             elicitation_handler: None,
             mcp_protocol_version: None,
             session_name_update_tx: None,
-            use_login_shell_path: None,
             providers: Arc::default(),
         }
     }
@@ -148,19 +141,6 @@ impl AgentConfig {
         self.session_name_update_tx = tx;
         self
     }
-
-    pub fn with_use_login_shell_path(mut self, use_login_shell_path: bool) -> Self {
-        self.use_login_shell_path = Some(use_login_shell_path);
-        self
-    }
-
-    fn resolve_use_login_shell_path(&self) -> bool {
-        resolve_use_login_shell_path(self.use_login_shell_path, &self.goose_platform)
-    }
-}
-
-fn resolve_use_login_shell_path(explicit: Option<bool>, platform: &GoosePlatform) -> bool {
-    explicit.unwrap_or(matches!(platform, GoosePlatform::GooseDesktop))
 }
 
 /// The main goose Agent
@@ -234,7 +214,6 @@ impl Agent {
         let scheduler = config.scheduler_service.clone();
         let inspection_session_manager = Arc::clone(&config.session_manager);
         let permission_manager = Arc::clone(&config.permission_manager);
-        let use_login_shell_path = config.resolve_use_login_shell_path();
         Arc::new(Self {
             config,
             extension_manager: Arc::new(ExtensionManager::new(
@@ -243,7 +222,6 @@ impl Agent {
                 scheduler,
                 client_name,
                 capabilities,
-                use_login_shell_path,
             )),
             tool_confirmation_coordinator: ToolConfirmationCoordinator::new(),
             tool_inspection_manager: Self::create_tool_inspection_manager(
@@ -251,10 +229,7 @@ impl Agent {
                 providers,
                 inspection_session_manager,
             ),
-            hook_manager: crate::hooks::HookManager::load(
-                std::env::current_dir().ok().as_deref(),
-                use_login_shell_path,
-            ),
+            hook_manager: crate::hooks::HookManager::load(std::env::current_dir().ok().as_deref()),
             #[cfg(test)]
             stop_hook_block_cap_override: None,
             steer_queues: Mutex::new(HashMap::new()),
@@ -321,6 +296,23 @@ impl Agent {
             .lock()
             .await
             .push_back(message);
+    }
+
+    /// Hands `text` to the session's running turn without interrupting it. A provider that
+    /// runs its own agent loop takes it directly (`Injected`, or `Declined` while it cannot,
+    /// leaving the message with the caller). Otherwise (`Unsupported`) it waits in goose's
+    /// loop, which adds it between model and tool turns and yields it in the reply stream.
+    pub async fn steer_running_turn(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<crate::providers::base::SteerOutcome> {
+        let outcome = self.provider(session_id).await?.steer(text).await?;
+        if outcome == crate::providers::base::SteerOutcome::Unsupported {
+            self.steer(session_id, Message::user().with_text(text))
+                .await;
+        }
+        Ok(outcome)
     }
 
     pub async fn discard_pending_steers(&self, session_id: &str) {
@@ -618,90 +610,27 @@ impl Agent {
             .unwrap_or_else(|_| {
                 crate::context_mgmt::compute_tool_call_cutoff(context_limit, compaction_threshold)
             });
-        let manages_own_context = provider.manages_own_context();
-        let tool_pair_compaction_enabled =
-            crate::context_mgmt::tool_pair_summarization_enabled() && !manages_own_context;
 
-        let mut operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
-            Arc::new(SteerOperation::new(steer_queue, self.hook_manager.clone())),
-            Arc::new(BangShellOperation::new()),
-        ];
-        if !manages_own_context {
-            operations.push(Arc::new(CompactionOperation::new(
-                provider.clone(),
-                model_config.clone(),
-                context_limit,
-                compaction_threshold,
-            )));
-        }
-        let remaining_operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
-            Arc::new(ToolPairCompactionOperation::new(
-                provider.clone(),
-                model_config.clone(),
-                tool_call_cutoff,
-                tool_pair_compaction_enabled,
-            )),
-            Arc::new(ToolApprovalOperation::new(&self.tool_inspection_manager)),
-            Arc::new(DoctorOperation::new(self.config.session_manager.clone())),
-            Arc::new(ProjectOperation),
-            Arc::new(SkillOperation::new(
-                self.hook_manager.clone(),
-                Arc::clone(&extension_lease),
-            )),
-            // Before RecipeOperation: a `delegate` response only means the subagent
-            // started, so a final output from the same batch must not be shown until
-            // the subagents have run.
-            Arc::new(SubagentOperation::new(
-                SubagentRunner::new(Arc::clone(self)),
-                cancel.clone(),
-            )),
-            Arc::new(RecipeOperation::new(
-                provider.clone(),
-                self.hook_manager.clone(),
-            )),
-            Arc::new(ToolExecutionOperation::new(
-                self.extension_manager.clone(),
-                self.hook_manager.clone(),
-                Arc::clone(&extension_lease),
-            )),
-            Arc::new(UnknownToolOperation::new(self.hook_manager.clone())),
-            Arc::new(RetryOperation::new(
-                std::time::Duration::from_secs(retry_timeout),
-                std::time::Duration::from_secs(on_failure_timeout),
-            )),
-            Arc::new(EmptyResponseOperation),
-            Arc::new(StopHookOperation::new(
-                self.hook_manager.clone(),
-                stop_hook_block_cap,
-            )),
-            Arc::new(ExitOnErrorOperation),
-            Arc::new(MaxTurnsOperation::new(max_turns)),
-        ];
-        operations.extend(remaining_operations);
-        let request_preparer = GooseInferenceRequestPreparer {
+        build_state_machine(StateMachineConfig {
+            provider,
+            model_config,
+            context_limit,
+            compaction_threshold,
+            tool_call_cutoff,
+            tool_pair_summarization: crate::context_mgmt::tool_pair_summarization_enabled(),
+            session_manager: self.config.session_manager.clone(),
             extension_manager: Arc::clone(&self.extension_manager),
             extension_lease,
             tool_inspection_manager: &self.tool_inspection_manager,
-            context_limit,
-        };
-        let status_operation =
-            Arc::new(StatusOperation::new(provider.clone(), model_config.clone()));
-        let inference_provider = Arc::new(GooseInferenceProvider::new(provider));
-        let inference = Arc::new(
-            InferenceRunner::new(inference_provider, model_config)
-                .with_request_preparer(Arc::new(request_preparer)),
-        );
-        let mut command_handlers = operations.clone();
-        command_handlers.push(status_operation);
-        let command_operation: Arc<dyn Operation<Session, GooseEffect> + '_> =
-            Arc::new(SlashCommandOperation::new(command_handlers));
-        let steps = std::iter::once(command_operation)
-            .chain(operations)
-            .map(Step::Operation)
-            .chain(std::iter::once(Step::Inference(inference)))
-            .collect();
-
-        StateMachine::new(steps, cancel)
+            hook_manager: self.hook_manager.clone(),
+            steer_queue,
+            subagent_runner: ForegroundSubagentRunner::new(Arc::clone(self)),
+            retry_timeout: std::time::Duration::from_secs(retry_timeout),
+            on_failure_timeout: std::time::Duration::from_secs(on_failure_timeout),
+            stop_hook_block_cap,
+            max_turns,
+            cancel,
+        })
     }
 
     pub(crate) async fn reply_with_state_machine(
@@ -1620,30 +1549,6 @@ mod tests {
             .await
             .unwrap();
         (agent, session, data_dir)
-    }
-
-    #[test]
-    fn resolve_use_login_shell_path_defaults_by_platform() {
-        assert!(resolve_use_login_shell_path(
-            None,
-            &GoosePlatform::GooseDesktop
-        ));
-        assert!(!resolve_use_login_shell_path(
-            None,
-            &GoosePlatform::GooseCli
-        ));
-    }
-
-    #[test]
-    fn resolve_use_login_shell_path_explicit_overrides_platform() {
-        assert!(resolve_use_login_shell_path(
-            Some(true),
-            &GoosePlatform::GooseCli
-        ));
-        assert!(!resolve_use_login_shell_path(
-            Some(false),
-            &GoosePlatform::GooseDesktop
-        ));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Read-only navigator for the subagent sessions a parent session delegates to.
-//! Opened with Tab while a turn runs, or with `/children` between turns.
+//! Opened with Tab while a turn runs, with `/children` between turns, or on a child chosen
+//! from the dock (`dock.rs`), the persistent child list under the prompt.
 
+pub mod dock;
 mod keys;
 pub mod router;
 #[cfg(unix)]
@@ -20,7 +22,13 @@ pub use keys::Key;
 use rmcp::model::{ContentBlock, Role};
 use std::sync::Arc;
 use std::time::Duration;
-use view::{ChildRow, ChildStatus, LineKind, Navigator, Outcome, Snapshot, TranscriptLine};
+pub use terminal::EchoOff;
+/// Raw key input for a view the session drives itself (the dock's selection).
+pub use terminal::KeyListener as KeyReader;
+/// The alternate screen, for other full-screen views (the tool-call list).
+pub use terminal::Screen;
+pub use view::ChildRow;
+use view::{ChildStatus, LineKind, Navigator, Outcome, Snapshot, TranscriptLine};
 
 pub const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const TOOL_RESULT_CHARS: usize = 200;
@@ -70,6 +78,13 @@ impl ChildSessionNavigator {
             self.router = Some(router::RouterChildren::start(source, router_session_id));
         }
         self
+    }
+
+    /// Reads keys for the whole turn, so text can be typed while the agent works.
+    pub fn listen_for_input(&mut self) {
+        self.has_children = true;
+        self.hinted = true;
+        self.listen();
     }
 
     pub fn watches_router(&self) -> bool {
@@ -186,6 +201,41 @@ impl ChildSessionNavigator {
         self.listener = None;
     }
 
+    /// Opens the navigator inside `child` (chosen from the dock) while a turn runs.
+    pub async fn open_at(&mut self, child: &ChildRow, turn_active: bool) {
+        if !self.available {
+            return;
+        }
+        let mut navigator = Navigator::default();
+        navigator.enter(child);
+        self.open = Some(OpenView {
+            screen: terminal::Screen::enter(),
+            navigator,
+            snapshot: Snapshot::default(),
+            frame: view::Frame::default(),
+        });
+        self.refresh(turn_active).await;
+    }
+
+    /// `browse`, starting inside `child`.
+    pub async fn browse_at(&mut self, child: &ChildRow) {
+        if !self.available {
+            return;
+        }
+        self.has_children = true;
+        self.hinted = true;
+        self.listen();
+        self.open_at(child, false).await;
+        let mut tick = tokio::time::interval(REFRESH_INTERVAL);
+        while self.is_open() {
+            tokio::select! {
+                key = self.next_key() => self.handle_key(key, false).await,
+                _ = tick.tick() => self.refresh(false).await,
+            }
+        }
+        self.suspend();
+    }
+
     /// Opens the navigator between turns, when completed and failed children stay inspectable.
     pub async fn browse(&mut self) {
         if !self.available {
@@ -275,6 +325,19 @@ async fn load_snapshot(
     Ok(snapshot)
 }
 
+/// A session's own goose subagents as top-level rows, for the dock.
+pub(super) async fn goose_children(
+    session_manager: &SessionManager,
+    session_id: &str,
+    turn_active: bool,
+) -> anyhow::Result<Vec<ChildRow>> {
+    Ok(
+        load_goose_snapshot(session_manager, session_id, None, turn_active)
+            .await?
+            .children,
+    )
+}
+
 async fn load_goose_snapshot(
     session_manager: &SessionManager,
     root_id: &str,
@@ -294,6 +357,11 @@ async fn load_goose_snapshot(
         .into_iter()
         .map(|child| ChildRow {
             status: child_status(states.get(&child.id).copied(), turn_active),
+            model: child
+                .model_config
+                .map(|config| config.model_name)
+                .unwrap_or_else(|| "unknown model".to_string()),
+            started_at: Some(child.created_at),
             label: child.name,
             activity: child.last_message_snippet.unwrap_or_default(),
             id: child.id,

@@ -7,9 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use goose_provider_types::base::Provider;
-use goose_provider_types::conversation::message::{
-    ActionRequiredData, InferenceMetadata, Message, MessageContent,
-};
+use goose_provider_types::conversation::message::{InferenceMetadata, Message, MessageContent};
 use goose_provider_types::conversation::token_usage::ProviderUsage;
 use goose_provider_types::conversation::{
     effective_role, fix_conversation, merge_consecutive_messages_for_request, Conversation,
@@ -276,35 +274,7 @@ fn ends_with_provider_turn(messages: &[Message]) -> bool {
     })
 }
 
-fn has_open_tool_approval(turn: &[Message]) -> bool {
-    let mut goose_calls = HashSet::new();
-    let mut answered = HashSet::new();
-    let mut prompted = Vec::new();
-    for content in turn.iter().flat_map(|message| &message.content) {
-        match content {
-            MessageContent::ToolRequest(request) if !request.was_executed_externally() => {
-                goose_calls.insert(request.id.as_str());
-            }
-            MessageContent::ToolResponse(response) => {
-                answered.insert(response.id.as_str());
-            }
-            MessageContent::ActionRequired(action) => {
-                if let ActionRequiredData::ToolConfirmation { id, .. } = &action.data {
-                    prompted.push(id.as_str());
-                }
-            }
-            _ => {}
-        }
-    }
-    prompted
-        .into_iter()
-        .any(|id| goose_calls.contains(id) && !answered.contains(id))
-}
-
 fn should_infer(conversation: &Conversation, turn: &[Message]) -> bool {
-    if has_open_tool_approval(turn) {
-        return false;
-    }
     let projected = messages_for_provider(conversation, turn, true);
     if projected
         .last()
@@ -461,6 +431,11 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
                 }
             }
 
+            // Native agents own their tools and context. Filter Goose's internal
+            // instructions before role merging erases the turn-context marker.
+            if self.provider.manages_own_context() {
+                messages_for_provider.retain(|message| !message.is_turn_context());
+            }
             let projected =
                 Conversation::new_unvalidated(messages_for_provider).agent_visible_messages();
             let (fixed, _) = fix_conversation(Conversation::new_unvalidated(projected));
@@ -541,7 +516,12 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
                     .any(|message| message.metadata.output_token_limit_reached)
                     && output.accumulator.iter().all(is_empty_response)
             };
-            if !empty_output || successful_tool_response || emit.cancel_token().is_cancelled() {
+            // A provider that keeps its own conversation (an ACP agent) already holds the
+            // prompt: sending it again repeats the user's message to the agent, and asking the
+            // user to resend does the same. Its empty answer is an answer, e.g. a router that
+            // queued the message for a turn already running.
+            let answered = self.provider.manages_own_context();
+            if !empty_output || successful_tool_response || answered || emit.cancel_token().is_cancelled() {
                 break empty_output;
             }
             self.output().accumulator.clear();
@@ -564,6 +544,15 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
             return applied(self.take_output());
             };
 
+            if empty_output && !successful_tool_response && self.provider.manages_own_context() {
+                // Records the turn as answered without showing anything: an empty message is
+                // projected away, which would leave the user's message unanswered and infer again.
+                self.output().accumulator.clear();
+                let answered = Message::assistant()
+                    .with_text("(the agent's turn ended with no output)")
+                    .with_visibility(false, true);
+                self.emit_message(answered, emit);
+            }
             if empty_output && successful_tool_response {
                 let message = {
                     let mut output = self.output();
@@ -590,9 +579,6 @@ impl<S: MaybeSync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use goose_provider_types::conversation::message::TOOL_META_EXTERNAL_DISPATCH_KEY;
-    use goose_provider_types::permission::Permission;
-    use rmcp::model::{CallToolRequestParams, CallToolResult};
 
     #[test]
     fn provider_session_id_comes_only_from_latest_inference() {
@@ -629,70 +615,6 @@ mod tests {
         assert!(!is_empty_response(
             &Message::assistant().with_content(MessageContent::thinking("", "sig-omitted"))
         ));
-    }
-
-    fn call(id: &str) -> Message {
-        Message::assistant().with_tool_request(id, Ok(CallToolRequestParams::new("write")))
-    }
-
-    fn prompt(id: &str) -> Message {
-        Message::assistant()
-            .with_action_required(id, "write".to_string(), Default::default(), None)
-            .user_only()
-    }
-
-    fn answer(id: &str) -> Message {
-        Message::user().with_tool_response(id, Ok(CallToolResult::success(Vec::new())))
-    }
-
-    #[test]
-    fn a_tool_approval_stays_open_until_the_call_is_answered() {
-        assert!(has_open_tool_approval(&[call("write"), prompt("write")]));
-
-        let decided = Message::user().with_content(
-            MessageContent::action_required_tool_confirmation_response(
-                "write",
-                Permission::AllowOnce,
-            ),
-        );
-        assert!(has_open_tool_approval(&[
-            call("write"),
-            prompt("write"),
-            decided
-        ]));
-
-        assert!(!has_open_tool_approval(&[
-            call("write"),
-            prompt("write"),
-            answer("write")
-        ]));
-    }
-
-    #[test]
-    fn prompts_without_a_goose_call_are_not_open() {
-        assert!(!has_open_tool_approval(&[prompt("cli-request")]));
-
-        let external = Message::assistant().with_tool_request_with_metadata(
-            "external",
-            Ok(CallToolRequestParams::new("write")),
-            None,
-            Some(serde_json::json!({ TOOL_META_EXTERNAL_DISPATCH_KEY: true })),
-        );
-        assert!(!has_open_tool_approval(&[external, prompt("external")]));
-    }
-
-    #[test]
-    fn no_inference_while_a_tool_approval_is_open() {
-        let conversation = Conversation::new_unvalidated([
-            Message::user().with_text("add and write"),
-            Message::assistant()
-                .with_tool_request("free", Ok(CallToolRequestParams::new("add")))
-                .with_tool_request("gated", Ok(CallToolRequestParams::new("write"))),
-            answer("free"),
-            prompt("gated"),
-        ]);
-        let turn = messages_since_kickoff(&conversation).unwrap();
-        assert!(!should_infer(&conversation, turn));
     }
 
     #[test]

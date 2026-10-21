@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use crate::acp::{
     AcpProviderConfig, ACP_CURRENT_MODEL,
 };
 use crate::config::search_path::SearchPaths;
-use crate::config::Config;
+use crate::config::{Config, ConfigError};
 use crate::providers::base::{
     current_working_dir, ProviderDef, ProviderDescriptor, ProviderMetadata,
 };
@@ -38,7 +38,7 @@ impl goose_providers::base::ProviderDescriptor for RouterAcpProvider {
         )
         .with_setup_steps(vec![
             "Install router-acp and connect its provider accounts",
-            "Point ROUTER_ACP_CONFIG at your router.yaml (default: ~/.config/router-acp/router.yaml)",
+            "Use .router-acp/router.yaml for project overrides, or set ROUTER_ACP_CONFIG to select a specific file",
         ])
         .with_setup(
             ProviderSetupMetadata::cli_agent(ROUTER_ACP_BINARY, &["router-acp"])
@@ -49,14 +49,32 @@ impl goose_providers::base::ProviderDescriptor for RouterAcpProvider {
     }
 }
 
-/// router-acp requires an explicit config; the default matches where router-acp hosts write it.
-fn router_config_path(config: &Config) -> Result<PathBuf> {
-    if let Ok(path) = config.get_param::<String>(ROUTER_ACP_CONFIG_KEY) {
-        return Ok(PathBuf::from(shellexpand::tilde(&path).into_owned()));
+/// The router owns project discovery, precedence and environment expansion.
+/// Hosts use its selected path for both ACP startup and read-only state queries.
+fn router_config_path(config: &Config, binary: &Path, cwd: &Path) -> Result<PathBuf> {
+    let explicit = match config.get_param::<String>(ROUTER_ACP_CONFIG_KEY) {
+        Ok(value) => Some(value),
+        Err(ConfigError::NotFound(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut command = std::process::Command::new(binary);
+    command
+        .args(["config-path", "--cwd"])
+        .arg(cwd)
+        .stdin(Stdio::null());
+    if let Some(path) = explicit {
+        command.arg("--config").arg(path);
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Set {ROUTER_ACP_CONFIG_KEY} to your router.yaml"))?;
-    Ok(home.join(".config").join("router-acp").join("router.yaml"))
+    let output = command.output()?;
+    anyhow::ensure!(output.status.success(),
+        "router-acp could not resolve its configuration; install a version supporting config-path and check ROUTER_ACP_CONFIG");
+    let selected = String::from_utf8(output.stdout)?;
+    let selected = PathBuf::from(selected.trim());
+    anyhow::ensure!(
+        selected.is_absolute(),
+        "router-acp returned a non-absolute configuration path"
+    );
+    Ok(selected)
 }
 
 pub fn is_router_acp(provider_name: &str) -> bool {
@@ -73,12 +91,15 @@ pub struct RouterStateSource {
 
 impl RouterStateSource {
     pub fn configured() -> Result<Self> {
-        Ok(Self {
-            binary: SearchPaths::builder()
-                .with_npm()
-                .resolve(ROUTER_ACP_BINARY)?,
-            config: router_config_path(Config::global())?,
-        })
+        Self::configured_for(&current_working_dir())
+    }
+
+    fn configured_for(cwd: &Path) -> Result<Self> {
+        let binary = SearchPaths::builder()
+            .with_npm()
+            .resolve(ROUTER_ACP_BINARY)?;
+        let config = router_config_path(Config::global(), &binary, cwd)?;
+        Ok(Self { binary, config })
     }
 
     /// Delegate panels of every given router session, from router-acp's read-only
@@ -199,7 +220,7 @@ impl RouterAcpProvider {
             let RouterStateSource {
                 binary: resolved_command,
                 config: router_config,
-            } = RouterStateSource::configured()?;
+            } = RouterStateSource::configured_for(&working_dir)?;
             let goose_mode = config.resolve_goose_mode()?;
             let model = if use_default_model {
                 ACP_CURRENT_MODEL.to_string()
@@ -285,24 +306,31 @@ mod tests {
         assert!(parse_delegates(other).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn router_config_defaults_to_the_router_acp_home_and_honors_overrides() {
+    fn router_config_uses_native_discovery_and_forwards_explicit_overrides() {
+        use std::os::unix::fs::PermissionsExt;
         let _guard = env_lock::lock_env([(ROUTER_ACP_CONFIG_KEY, None::<&str>)]);
         let directory = tempfile::tempdir().unwrap();
         let config = Config::new(directory.path().join("config.yaml"), "test").unwrap();
-        let home = dirs::home_dir().unwrap();
-
+        let binary = directory.path().join("router-acp");
+        let cwd = directory.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(&binary, "#!/bin/sh\n[ \"$1\" = config-path ] && [ \"$2\" = --cwd ] || exit 1\nif [ \"$4\" = --config ]; then printf '%s/explicit.yaml\\n' \"$3\"; else printf '%s/.router-acp/router.yaml\\n' \"$3\"; fi\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
-            router_config_path(&config).unwrap(),
-            home.join(".config/router-acp/router.yaml")
+            router_config_path(&config, &binary, &cwd).unwrap(),
+            cwd.join(".router-acp/router.yaml")
         );
 
         config
             .set_param(ROUTER_ACP_CONFIG_KEY, "~/routers/kory.yaml")
             .unwrap();
         assert_eq!(
-            router_config_path(&config).unwrap(),
-            home.join("routers/kory.yaml")
+            router_config_path(&config, &binary, &cwd).unwrap(),
+            cwd.join("explicit.yaml")
         );
+        std::fs::write(&binary, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(router_config_path(&config, &binary, &cwd).is_err());
     }
 }

@@ -38,7 +38,10 @@ use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY};
 use crate::permission::permission_confirmation::PrincipalType;
 use crate::permission::{Permission, PermissionConfirmation};
-use crate::providers::base::{MessageStream, PermissionRouting, Provider, UnsolicitedUpdate};
+use crate::providers::base::{
+    ExtensionNotification, MessageStream, PermissionRouting, Provider, SteerOutcome,
+    UnsolicitedUpdate,
+};
 use crate::subprocess::configure_subprocess;
 use crate::token_counter::create_token_counter;
 use crate::utils::sanitize_unicode_tags;
@@ -103,6 +106,11 @@ enum ClientRequest {
         response_tx: mpsc::Sender<AcpUpdate>,
     },
 }
+
+/// ACP extension request that injects a user message into the session's running turn.
+const SESSION_STEERING_METHOD: &str = "_session/steering";
+
+type SharedConnection = Arc<Mutex<Option<ConnectionTo<Agent>>>>;
 
 // tokio I/O handles can't move between runtimes, so the child process must be
 // spawned inside the OS thread. This closure lets start() share all other logic.
@@ -422,6 +430,9 @@ pub struct AcpProvider {
     /// Latest `size` reported by the ACP server in a `session/update` →
     /// `usage_update` notification. 0 means no real update has arrived yet.
     context_size: Arc<AtomicU64>,
+    /// Latest `used` (tokens currently in the agent's context) from the same notification,
+    /// stored plus one so that 0 means no report has arrived yet.
+    context_used: Arc<AtomicU64>,
 
     /// Config option id used to select the model, if this agent supports it.
     model_config_option_id: Option<String>,
@@ -441,6 +452,13 @@ pub struct AcpProvider {
     /// the session by itself after goose's turn ended.
     unsolicited: broadcast::Sender<UnsolicitedUpdate>,
     unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
+    /// Notifications the agent sends under extension methods (`_router/…`).
+    extension_notifications: broadcast::Sender<ExtensionNotification>,
+
+    /// The live connection, for requests that must not wait behind a prompt in flight.
+    connection: SharedConnection,
+    /// Set once the agent answered `_session/steering` with method-not-found.
+    steering_unsupported: AtomicBool,
 
     tx: Option<mpsc::Sender<ClientRequest>>,
     cancel_tx: Option<oneshot::Sender<()>>,
@@ -537,17 +555,23 @@ impl AcpProvider {
         let pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let context_size = Arc::new(AtomicU64::new(0));
+        let context_used = Arc::new(AtomicU64::new(0));
         let effort = AcpEffortState::new();
+        let connection = SharedConnection::default();
         let (unsolicited_tx, unsolicited_rx) = mpsc::unbounded_channel();
         let (unsolicited, _) = broadcast::channel(UNSOLICITED_CAPACITY);
         tokio::spawn(relay_unsolicited(unsolicited_rx, unsolicited.clone()));
+        let (extension_notifications, _) = broadcast::channel(UNSOLICITED_CAPACITY);
         let client_loop = AcpClientLoop::new(
             config,
             goose_mode_shared.clone(),
             pending_tool_updates.clone(),
             context_size.clone(),
+            context_used.clone(),
             effort.clone(),
             unsolicited_tx.clone(),
+            connection.clone(),
+            extension_notifications.clone(),
         );
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx, cancel_rx));
@@ -590,11 +614,15 @@ impl AcpProvider {
             pending_tool_updates,
             handoff_context_sent: Arc::new(AtomicBool::new(false)),
             context_size,
+            context_used,
             model_config_option_id,
             applied_model: Arc::new(Mutex::new(applied_model)),
             effort,
             unsolicited,
             unsolicited_tx,
+            extension_notifications,
+            connection,
+            steering_unsupported: AtomicBool::new(false),
             tx: client_loop_guard.tx.take(),
             cancel_tx: client_loop_guard.cancel_tx.take(),
             loop_thread: client_loop_guard.thread.take(),
@@ -829,6 +857,13 @@ impl Provider for AcpProvider {
         Some(self.acp_session_id().to_string())
     }
 
+    fn skip_canonical_filtering(&self) -> bool {
+        // ACP agents advertise their own model ids, which are CLI/account-specific
+        // and often absent from the canonical registry, and the agent's order is
+        // its priority order. Keep the live list intact for inventory/config.
+        true
+    }
+
     async fn resume(&self, session_id: &str) -> Result<(), ProviderError> {
         if self.acp_session_id().0.as_ref() == session_id {
             return Ok(());
@@ -907,6 +942,72 @@ impl Provider for AcpProvider {
         Some(self.unsolicited.subscribe())
     }
 
+    fn subscribe_extension_notifications(
+        &self,
+    ) -> Option<broadcast::Receiver<ExtensionNotification>> {
+        Some(self.extension_notifications.subscribe())
+    }
+
+    /// Straight onto the connection, like `steer`: a prompt may be in flight.
+    async fn extension_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let Some(cx) = self.connection.lock().unwrap().clone() else {
+            return Err(ProviderError::RequestFailed(
+                "the agent is not connected".to_string(),
+            ));
+        };
+        let mut params = match params {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        params.insert(
+            "sessionId".to_string(),
+            serde_json::Value::String(self.acp_session_id().0.to_string()),
+        );
+        let request =
+            agent_client_protocol::UntypedMessage::new(method, serde_json::Value::Object(params))
+                .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
+        cx.send_request(request)
+            .block_task()
+            .await
+            .map_err(provider_error_from_acp)
+    }
+
+    /// `_session/steering` on the active session. It goes straight onto the connection: the
+    /// request loop is busy with the very prompt being steered.
+    async fn steer(&self, text: &str) -> Result<SteerOutcome, ProviderError> {
+        if self.steering_unsupported.load(Ordering::Acquire) {
+            return Ok(SteerOutcome::Unsupported);
+        }
+        let Some(cx) = self.connection.lock().unwrap().clone() else {
+            return Ok(SteerOutcome::Declined);
+        };
+        let request = agent_client_protocol::UntypedMessage::new(
+            SESSION_STEERING_METHOD,
+            serde_json::json!({
+                "sessionId": self.acp_session_id(),
+                "prompt": [ContentBlock::Text(TextContent::new(text))],
+            }),
+        )
+        .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
+        match cx.send_request(request).block_task().await {
+            Ok(response) => Ok(
+                match response.get("outcome").and_then(|outcome| outcome.as_str()) {
+                    Some("injected") => SteerOutcome::Injected,
+                    _ => SteerOutcome::Declined,
+                },
+            ),
+            Err(error) if error.code == agent_client_protocol::ErrorCode::MethodNotFound => {
+                self.steering_unsupported.store(true, Ordering::Release);
+                Ok(SteerOutcome::Unsupported)
+            }
+            Err(error) => Err(provider_error_from_acp(error)),
+        }
+    }
+
     async fn set_thinking_effort(
         &self,
         session_id: &str,
@@ -952,6 +1053,11 @@ impl Provider for AcpProvider {
 
     fn manages_own_context(&self) -> bool {
         true
+    }
+
+    fn context_tokens(&self) -> Option<usize> {
+        let stored = self.context_used.load(Ordering::Relaxed);
+        stored.checked_sub(1).map(|used| used as usize)
     }
 
     async fn handle_permission_confirmation(
@@ -1236,18 +1342,25 @@ struct AcpClientLoop {
     prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     context_size: Arc<AtomicU64>,
+    context_used: Arc<AtomicU64>,
     effort: AcpEffortState,
     unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
+    connection: SharedConnection,
+    extension_notifications: broadcast::Sender<ExtensionNotification>,
 }
 
 impl AcpClientLoop {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: AcpProviderConfig,
         goose_mode: Arc<Mutex<GooseMode>>,
         pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
         context_size: Arc<AtomicU64>,
+        context_used: Arc<AtomicU64>,
         effort: AcpEffortState,
         unsolicited_tx: mpsc::UnboundedSender<Unsolicited>,
+        connection: SharedConnection,
+        extension_notifications: broadcast::Sender<ExtensionNotification>,
     ) -> Self {
         Self {
             config,
@@ -1255,8 +1368,11 @@ impl AcpClientLoop {
             prompt_response_tx: Arc::new(Mutex::new(None)),
             pending_tool_updates,
             context_size,
+            context_used,
             effort,
             unsolicited_tx,
+            connection,
+            extension_notifications,
         }
     }
 
@@ -1311,8 +1427,11 @@ impl AcpClientLoop {
             prompt_response_tx,
             pending_tool_updates,
             context_size,
+            context_used,
             effort,
             unsolicited_tx,
+            connection,
+            extension_notifications,
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
@@ -1327,6 +1446,7 @@ impl AcpClientLoop {
                     let goose_mode = goose_mode.clone();
                     let pending_tool_updates = pending_tool_updates.clone();
                     let context_size = context_size.clone();
+                    let context_used = context_used.clone();
                     let session_state = session_state.clone();
                     let unsolicited_tx = unsolicited_tx.clone();
                     async move |notification: SessionNotification, _cx| {
@@ -1374,6 +1494,19 @@ impl AcpClientLoop {
                             }
                             SessionUpdate::UsageUpdate(usage) => {
                                 context_size.store(usage.size, Ordering::Relaxed);
+                                context_used.store(usage.used.saturating_add(1), Ordering::Relaxed);
+                            }
+                            SessionUpdate::SessionInfoUpdate(update) => {
+                                let busy = update
+                                    .meta
+                                    .as_ref()
+                                    .and_then(|meta| meta.get("routerAcp"))
+                                    .and_then(|router| router.get("busy"))
+                                    .and_then(|busy| busy.as_bool());
+                                super::session_activity::update(
+                                    update.title.value().cloned(),
+                                    busy,
+                                );
                             }
                             _ => {}
                         }
@@ -1506,6 +1639,21 @@ impl AcpClientLoop {
                 },
                 agent_client_protocol::on_receive_notification!(),
             )
+            // Extension notifications (`_router/…`) go to whoever subscribed to them.
+            .on_receive_notification(
+                {
+                    let extension_notifications = extension_notifications.clone();
+                    async move |notification: agent_client_protocol::UntypedMessage, _cx| {
+                        let (method, params) = notification.into_parts();
+                        if method.starts_with('_') {
+                            let _ = extension_notifications
+                                .send(ExtensionNotification { method, params });
+                        }
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
             .on_receive_request(
                 {
                     let prompt_response_tx = prompt_response_tx.clone();
@@ -1539,6 +1687,7 @@ impl AcpClientLoop {
                 agent_client_protocol::on_receive_request!(),
             )
             .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
+                *connection.lock().unwrap() = Some(cx.clone());
                 handle_requests(
                     config,
                     goose_mode,
@@ -2652,11 +2801,15 @@ mod tests {
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
                 handoff_context_sent: Arc::new(AtomicBool::new(false)),
                 context_size: Arc::new(AtomicU64::new(0)),
+                context_used: Arc::new(AtomicU64::new(0)),
                 model_config_option_id: None,
                 applied_model: Arc::new(Mutex::new(None)),
                 effort: AcpEffortState::new(),
                 unsolicited: broadcast::channel(1).0,
                 unsolicited_tx: mpsc::unbounded_channel().0,
+                extension_notifications: broadcast::channel(1).0,
+                connection: SharedConnection::default(),
+                steering_unsupported: AtomicBool::new(false),
                 tx,
                 cancel_tx: None,
                 loop_thread: None,
@@ -3034,6 +3187,16 @@ mod tests {
             provider.get_context_limit(&model.model_name, None).await,
             200_000
         );
+    }
+
+    #[tokio::test]
+    async fn context_tokens_report_the_latest_usage_update_only() {
+        let (provider, _) = test_provider();
+        assert_eq!(provider.context_tokens(), None);
+        provider.context_used.store(1, Ordering::Relaxed);
+        assert_eq!(provider.context_tokens(), Some(0));
+        provider.context_used.store(84_001, Ordering::Relaxed);
+        assert_eq!(provider.context_tokens(), Some(84_000));
     }
 
     #[tokio::test]
@@ -4996,5 +5159,199 @@ mod tests {
             updates.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    /// A message steered into a running prompt reaches the agent while the prompt is still in
+    /// flight; an agent without `_session/steering` reports it unsupported.
+    #[tokio::test]
+    async fn steering_reaches_the_agent_during_a_prompt() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+            PromptRequest, PromptResponse,
+        };
+        use agent_client_protocol::{
+            on_receive_request, Agent as ScriptedAgent, ByteStreams, UntypedMessage,
+        };
+        use futures::StreamExt;
+
+        async fn connect(steerable: bool) -> (AcpProvider, Arc<Mutex<Vec<serde_json::Value>>>) {
+            let (client_read, agent_write) = tokio::io::duplex(64 * 1024);
+            let (agent_read, client_write) = tokio::io::duplex(64 * 1024);
+            let steered = Arc::new(Mutex::new(Vec::new()));
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (agent_steered, agent_release) = (steered.clone(), release.clone());
+            tokio::spawn(async move {
+                let builder = ScriptedAgent
+                    .builder()
+                    .on_receive_request(
+                        async |_req: InitializeRequest, responder, _cx| {
+                            responder.respond(
+                                InitializeResponse::new(ProtocolVersion::LATEST)
+                                    .agent_capabilities(AgentCapabilities::new()),
+                            )
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async |_req: NewSessionRequest, responder, _cx| {
+                            responder.respond(NewSessionResponse::new(SessionId::new("steer-me")))
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async move |_req: PromptRequest, responder, cx| {
+                            let release = agent_release.clone();
+                            cx.spawn(async move {
+                                release.notified().await;
+                                responder.respond(PromptResponse::new(StopReason::EndTurn))
+                            })
+                        },
+                        on_receive_request!(),
+                    );
+                let transport = ByteStreams::new(agent_write.compat_write(), agent_read.compat());
+                if steerable {
+                    builder
+                        .on_receive_request(
+                            async move |req: UntypedMessage, responder, _cx| {
+                                agent_steered.lock().unwrap().push(req.params().clone());
+                                release.notify_one();
+                                responder.respond(serde_json::json!({"outcome": "injected"}))
+                            },
+                            on_receive_request!(),
+                        )
+                        .connect_to(transport)
+                        .await
+                } else {
+                    builder.connect_to(transport).await
+                }
+            });
+            let provider = AcpProvider::connect_with_transport(
+                "router-acp".to_string(),
+                GooseMode::Auto,
+                test_acp_config(HashMap::new(), None),
+                ByteStreams::new(client_write.compat_write(), client_read.compat()),
+            )
+            .await
+            .unwrap();
+            (provider, steered)
+        }
+
+        let (provider, steered) = connect(true).await;
+        let model = ModelConfig::new("test-model");
+        let mut stream = provider
+            .stream(&model, "", &[Message::user().with_text("work")], &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.steer("also this").await.unwrap(),
+            SteerOutcome::Injected
+        );
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        let steered = steered.lock().unwrap().clone();
+        assert_eq!(steered.len(), 1);
+        assert_eq!(steered[0]["sessionId"], "steer-me");
+        assert_eq!(steered[0]["prompt"][0]["text"], "also this");
+
+        let (provider, _) = connect(false).await;
+        assert_eq!(
+            provider.steer("hello").await.unwrap(),
+            SteerOutcome::Unsupported
+        );
+        assert!(provider.steering_unsupported.load(Ordering::Acquire));
+    }
+
+    /// An extension request carries the session id and returns the agent's answer; the
+    /// extension notifications the agent sends reach subscribers.
+    #[tokio::test]
+    async fn extension_requests_and_notifications_round_trip() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+        };
+        use agent_client_protocol::{
+            on_receive_request, Agent as ScriptedAgent, ByteStreams, UntypedMessage,
+        };
+
+        let (client_read, agent_write) = tokio::io::duplex(64 * 1024);
+        let (agent_read, client_write) = tokio::io::duplex(64 * 1024);
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        let agent_requested = requested.clone();
+        tokio::spawn(async move {
+            ScriptedAgent
+                .builder()
+                .on_receive_request(
+                    async |_req: InitializeRequest, responder, _cx| {
+                        responder.respond(
+                            InitializeResponse::new(ProtocolVersion::LATEST)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async |_req: NewSessionRequest, responder, _cx| {
+                        responder.respond(NewSessionResponse::new(SessionId::new("planner-1")))
+                    },
+                    on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |req: UntypedMessage, responder, cx| {
+                        agent_requested
+                            .lock()
+                            .unwrap()
+                            .push((req.method().to_string(), req.params().clone()));
+                        if req.params()["sessionId"] != "planner-1" {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("session is not in planner mode"),
+                            );
+                        }
+                        cx.send_notification(
+                            UntypedMessage::new(
+                                "_router/shutdown_progress",
+                                serde_json::json!({"sessionId": "planner-1", "phase": "saving"}),
+                            )
+                            .unwrap(),
+                        )?;
+                        responder.respond(serde_json::json!({"accepted": true}))
+                    },
+                    on_receive_request!(),
+                )
+                .connect_to(ByteStreams::new(
+                    agent_write.compat_write(),
+                    agent_read.compat(),
+                ))
+                .await
+        });
+        let provider = AcpProvider::connect_with_transport(
+            "router-acp".to_string(),
+            GooseMode::Auto,
+            test_acp_config(HashMap::new(), None),
+            ByteStreams::new(client_write.compat_write(), client_read.compat()),
+        )
+        .await
+        .unwrap();
+        let mut notifications = provider.subscribe_extension_notifications().unwrap();
+
+        let answer = provider
+            .extension_request("_router/planner_shutdown", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(answer, serde_json::json!({"accepted": true}));
+        assert_eq!(
+            requested.lock().unwrap().clone(),
+            [(
+                "_router/planner_shutdown".to_string(),
+                serde_json::json!({"sessionId": "planner-1"})
+            )]
+        );
+        let notification =
+            tokio::time::timeout(std::time::Duration::from_secs(5), notifications.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(notification.method, "_router/shutdown_progress");
+        assert_eq!(notification.params["phase"], "saving");
     }
 }

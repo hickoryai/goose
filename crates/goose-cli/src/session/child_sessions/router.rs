@@ -104,65 +104,29 @@ impl RouterChildren {
     }
 }
 
-/// How often the prompt-time worker status is re-read.
-const STATUS_INTERVAL: Duration = Duration::from_secs(5);
-
-/// One line grouping the planner workers directly under `root` by lifecycle, running
-/// first, or `None` when router-acp reports none. A work's latest session stands for it.
-pub fn status_line(delegates: &[RouterDelegate], root: &str) -> Option<String> {
-    let mut states = std::collections::BTreeMap::new();
+/// The rows the child dock shows under `root`: a planner work's latest session stands for it
+/// and sessions a later one replaced (`ended`) are left out.
+pub fn dock_rows(delegates: &[RouterDelegate], root: &str, now: DateTime<Utc>) -> Vec<ChildRow> {
+    let mut rows: Vec<ChildRow> = Vec::new();
     for delegate in delegates.iter().filter(|d| d.parent_id() == Some(root)) {
-        match delegate.state.as_deref() {
-            None | Some("ended") => {}
-            Some(state) => {
-                states.insert(delegate_label(delegate), state.to_string());
-            }
+        if delegate.state.as_deref() == Some("ended") {
+            continue;
         }
+        let label = delegate_label(delegate);
+        rows.retain(|row| row.label != label);
+        rows.push(ChildRow {
+            id: delegate.id.clone(),
+            label,
+            status: delegate_status(delegate, now),
+            model: delegate
+                .model
+                .clone()
+                .unwrap_or_else(|| "unknown model".to_string()),
+            started_at: delegate.created_at,
+            activity: latest_activity(&delegate.log),
+        });
     }
-    if states.is_empty() {
-        return None;
-    }
-    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-    for (label, state) in states {
-        match groups.iter_mut().find(|(group, _)| *group == state) {
-            Some((_, labels)) => labels.push(label),
-            None => groups.push((state, vec![label])),
-        }
-    }
-    groups.sort_by_key(|(state, _)| (state != "running", state.clone()));
-    let parts: Vec<String> = groups
-        .into_iter()
-        .map(|(state, labels)| format!("{} {state}: {}", labels.len(), labels.join(", ")))
-        .collect();
-    Some(format!(
-        "◆ workers · {} · /children to open",
-        parts.join(" · ")
-    ))
-}
-
-/// Reports the planner workers' status line under `root` each time it changes, so an idle
-/// prompt shows what the router is running without opening the navigator.
-pub fn watch_status(
-    source: RouterStateSource,
-    root: String,
-    notify: impl Fn(String) + Send + 'static,
-) -> AbortOnDropHandle<()> {
-    AbortOnDropHandle::new(tokio::spawn(async move {
-        let mut last: Option<String> = None;
-        loop {
-            if let Ok(delegates) = source
-                .delegates(std::slice::from_ref(&root), QUERY_TIMEOUT)
-                .await
-            {
-                let line = status_line(&delegates, &root);
-                if line.is_some() && line != last {
-                    notify(line.clone().unwrap_or_default());
-                }
-                last = line;
-            }
-            tokio::time::sleep(STATUS_INTERVAL).await;
-        }
-    }))
+    rows
 }
 
 pub fn rows_for(delegates: &[RouterDelegate], parent: &str, now: DateTime<Utc>) -> Vec<ChildRow> {
@@ -173,6 +137,11 @@ pub fn rows_for(delegates: &[RouterDelegate], parent: &str, now: DateTime<Utc>) 
             id: delegate.id.clone(),
             label: delegate_label(delegate),
             status: delegate_status(delegate, now),
+            model: delegate
+                .model
+                .clone()
+                .unwrap_or_else(|| "unknown model".to_string()),
+            started_at: delegate.created_at,
             activity: latest_activity(&delegate.log),
         })
         .collect()
@@ -404,6 +373,11 @@ mod tests {
             ]
         );
         assert!(rows[1].activity.starts_with("→ P=/work/repo; for i in"));
+        assert_eq!(rows[0].model, "opus[1m]");
+        assert_eq!(rows[0].started_at, Some(at("2026-10-13T20:32:10Z")));
+        let dock = dock_rows(&delegates, ROOT, at("2026-10-13T20:41:00Z"));
+        assert_eq!(dock[0].model, rows[0].model);
+        assert_eq!(dock[0].started_at, rows[0].started_at);
         assert!(rows_for(&delegates, &rows[0].id, at("2026-10-13T20:41:00Z")).is_empty());
     }
 
@@ -534,18 +508,21 @@ mod tests {
     }
 
     #[test]
-    fn status_line_groups_latest_workers_running_first() {
+    fn dock_rows_keep_each_works_latest_session() {
         let delegates = vec![
             worker("1", "rhythm-training", "ended"),
             worker("2", "rhythm-training", "running"),
-            worker("3", "lead-magnets", "running"),
-            worker("4", "secret-guard", "review-pending"),
+            worker("3", "lead-magnets", "review-pending"),
         ];
+        let rows = dock_rows(&delegates, ROOT, at("2020-01-01T00:00:00Z"));
+        let shown: Vec<_> = rows.iter().map(|r| (r.label.as_str(), r.status)).collect();
         assert_eq!(
-            status_line(&delegates, ROOT).unwrap(),
-            "◆ workers · 2 running: lead-magnets, rhythm-training · 1 review-pending: secret-guard · /children to open"
+            shown,
+            [
+                ("rhythm-training", ChildStatus::Running),
+                ("lead-magnets", ChildStatus::Completed)
+            ]
         );
-        assert!(status_line(&delegates, "another-session").is_none());
-        assert!(status_line(&captured(), ROOT).is_none());
+        assert!(dock_rows(&delegates, "another-session", at("2020-01-01T00:00:00Z")).is_empty());
     }
 }

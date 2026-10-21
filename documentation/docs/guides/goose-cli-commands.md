@@ -421,6 +421,29 @@ Generate diagnostics before reporting bugs to provide technical details that hel
 ### Task Execution
 
 #### run [options]
+
+An explicitly invoked skill can opt into deterministic headless completion validation using
+`metadata.headless-check` in its `SKILL.md` frontmatter:
+
+```yaml
+metadata:
+  headless-check:
+    command: [dotnet, run, --file, ci/ValidateSkillResult.cs, --]
+    timeout_seconds: 180
+```
+
+The command is an argument array executed in the invocation's working directory, without shell
+interpolation. It receives JSON on stdin containing `skill`, the original `arguments`, a fresh
+`run_id`, UTC `started_at`, and the final assistant `response`. The run identity and completion
+instructions accompany the canonical expanded skill in the user prompt, including for ACP
+providers that own their system prompts. The validator runs once after the agent finishes,
+including after a reported execution error. There are no automatic retries.
+
+The CLI exits successfully only when execution and validation both succeed. A nonzero checker
+exit, startup failure or timeout fails the CLI. Checker output is inherited on stdout in text
+mode and sent to stderr in JSON modes; streamed completion describes the agent turn, so consumers
+must also check the process exit status. Interactive sessions and skills without this metadata
+retain their existing behavior. Only invoke skills whose validator commands you trust.
 Execute commands from an instruction file or stdin. Check out the [full guide](/docs/guides/running-tasks) for more info.
 
 **Input Options:**
@@ -900,6 +923,8 @@ kory session --name use-custom-theme
 
 **Session Control:**
 - **`Ctrl+C`** - Clear the current line if text is entered, interrupt the current request if processing, or exit the session if line is empty
+- The implement and plan commands on router-acp use Auto mode for the session's lifetime, including later operator turns. goose announces a mode change once and leaves the global configuration unchanged. Tool cancellation or refusal is not an operator instruction to stop.
+- In a router planner session, cancelling a turn leaves the run active. goose prints the live worker and admissible-work counts, with `unknown` when the router cannot supply them. The prompt offers the shutdown quit confirmation; a second Ctrl+C within five seconds exits. `/shutdown` saves state and drains workers. `/exit` quits immediately and warns when workers may be cut off.
 - **`Ctrl+J`** - Add a newline. Can customize the character via `GOOSE_CLI_NEWLINE_KEY` in the [config file](/docs/guides/config-files) (e.g. `GOOSE_CLI_NEWLINE_KEY: n`) or as an [environment variable](/docs/guides/environment-variables#session-management). Avoid "c" and common terminal shortcuts like "r", "w", "z".
 
 **Navigation:**

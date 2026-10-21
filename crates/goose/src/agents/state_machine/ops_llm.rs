@@ -56,7 +56,7 @@ fn enrich_unclaimed_tool_errors(messages: &[Message], tools: &[rmcp::model::Tool
                 continue;
             };
             if metadata
-                .remove(super::ops_unknown_tool::UNCLAIMED_TOOL_ERROR)
+                .remove(super::ops_remaining_tool_calls::UNCLAIMED_TOOL_ERROR)
                 .is_none()
             {
                 continue;
@@ -136,6 +136,14 @@ impl Provider for GooseInferenceProvider {
 
     fn provider_session_id(&self) -> Option<String> {
         self.inner.provider_session_id()
+    }
+
+    fn manages_own_context(&self) -> bool {
+        self.inner.manages_own_context()
+    }
+
+    fn context_tokens(&self) -> Option<usize> {
+        self.inner.context_tokens()
     }
 
     async fn resume(&self, session_id: &str) -> Result<(), ProviderError> {

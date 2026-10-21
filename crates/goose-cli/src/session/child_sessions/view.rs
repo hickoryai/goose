@@ -1,4 +1,5 @@
 use super::keys::Key;
+use chrono::{DateTime, Utc};
 use console::{measure_text_width, style, truncate_str};
 use goose::providers::router_acp::DELEGATE_ID_SEPARATOR;
 use unicode_segmentation::UnicodeSegmentation;
@@ -16,7 +17,7 @@ pub enum ChildStatus {
 }
 
 impl ChildStatus {
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             ChildStatus::Running => "running",
             ChildStatus::Stopped => "stopped",
@@ -32,7 +33,27 @@ pub struct ChildRow {
     pub id: String,
     pub label: String,
     pub status: ChildStatus,
+    pub model: String,
+    pub started_at: Option<DateTime<Utc>>,
     pub activity: String,
+}
+
+impl ChildRow {
+    fn running_label(&self, now: DateTime<Utc>) -> String {
+        let model = sanitize(&self.model);
+        let Some(started_at) = self.started_at else {
+            return model;
+        };
+        let seconds = (now - started_at).num_seconds().max(0);
+        let elapsed = if seconds < 60 {
+            format!("{seconds}s")
+        } else if seconds < 3600 {
+            format!("{}m", seconds / 60)
+        } else {
+            format!("{}h{}m", seconds / 3600, seconds / 60 % 60)
+        };
+        format!("{model} [{elapsed}]")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,14 +118,16 @@ impl Navigator {
     pub fn handle(&mut self, key: Key, snapshot: &Snapshot, frame: &Frame) -> Outcome {
         let page = frame.transcript_rows.max(1);
         match key {
-            Key::Open | Key::Close => return Outcome::Close,
-            Key::Back if self.path.is_empty() => return Outcome::Close,
-            Key::Back => self.ascend(),
-            Key::Up => self.selected = self.selected.saturating_sub(1),
-            Key::Down => {
+            Key::Open | Key::Char('q') => return Outcome::Close,
+            Key::Escape | Key::Backspace | Key::Left if self.path.is_empty() => {
+                return Outcome::Close
+            }
+            Key::Escape | Key::Backspace | Key::Left => self.ascend(),
+            Key::Up | Key::Char('k') => self.selected = self.selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => {
                 self.selected = (self.selected + 1).min(snapshot.children.len().saturating_sub(1))
             }
-            Key::Enter => self.descend(snapshot, self.selected),
+            Key::Enter | Key::Right => self.descend(snapshot, self.selected),
             Key::PageUp => self.scroll_back += page,
             Key::PageDown => self.scroll_back = self.scroll_back.saturating_sub(page),
             Key::WheelUp if snapshot.transcript.is_some() => self.scroll_back += WHEEL_LINES,
@@ -122,8 +145,18 @@ impl Navigator {
                     self.descend(snapshot, index);
                 }
             }
+            _ => {}
         }
         Outcome::Stay
+    }
+
+    /// Starts inside `child`, as if it had been chosen from the top-level list.
+    pub fn enter(&mut self, child: &ChildRow) {
+        self.path.push(Crumb {
+            id: child.id.clone(),
+            label: child.label.clone(),
+            selected: 0,
+        });
     }
 
     fn descend(&mut self, snapshot: &Snapshot, index: usize) {
@@ -242,7 +275,7 @@ impl Navigator {
     }
 }
 
-fn child_row(child: &ChildRow, selected: bool, width: usize) -> String {
+pub(super) fn child_row(child: &ChildRow, selected: bool, width: usize) -> String {
     let marker = if selected { "›" } else { " " };
     // Router delegate ids all start with their parent's id; the tail tells them apart.
     let distinct = child
@@ -250,9 +283,14 @@ fn child_row(child: &ChildRow, selected: bool, width: usize) -> String {
         .rsplit_once(DELEGATE_ID_SEPARATOR)
         .map_or(child.id.as_str(), |(_, tail)| tail);
     let short_id: String = distinct.chars().take(SHORT_ID_CHARS).collect();
+    let detail = if child.status == ChildStatus::Running {
+        child.running_label(Utc::now())
+    } else {
+        child.status.label().to_string()
+    };
     let row = format!(
         "{marker} {:<9} {}  {short_id}  {}",
-        child.status.label(),
+        detail,
         sanitize(&child.label),
         sanitize(&child.activity)
     );
@@ -314,6 +352,8 @@ mod tests {
             id: id.to_string(),
             label: format!("task {id}"),
             status,
+            model: "opus 5.5".to_string(),
+            started_at: None,
             activity: "reading files".to_string(),
         }
     }
@@ -355,13 +395,38 @@ mod tests {
         assert_eq!(lines[0], "Child sessions");
         assert_eq!(
             lines[2],
-            "› running   task aaaaaaaaaa  aaaaaaaa  reading files"
+            "› opus 5.5  task aaaaaaaaaa  aaaaaaaa  reading files"
         );
         assert_eq!(
             lines[3],
             "  failed    task bbbbbbbbbb  bbbbbbbb  reading files"
         );
         assert!(lines[9].starts_with("↑↓ select"));
+    }
+
+    #[test]
+    fn running_label_advances_without_new_child_data() {
+        let start: DateTime<Utc> = "2026-10-19T10:00:00Z".parse().unwrap();
+        let mut child = row("child", ChildStatus::Running);
+        child.started_at = Some(start);
+        for (seconds, expected) in [
+            (-1, "0s"),
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m"),
+            (3599, "59m"),
+            (3600, "1h0m"),
+            (10920, "3h2m"),
+        ] {
+            assert_eq!(
+                child.running_label(start + chrono::Duration::seconds(seconds)),
+                format!("opus 5.5 [{expected}]")
+            );
+        }
+        child.started_at = Some(Utc::now() - chrono::Duration::minutes(182));
+        let rendered = child_row(&child, false, 100);
+        assert!(rendered.contains("opus 5.5 [3h2m]"), "{rendered}");
+        assert!(!rendered.contains("running"));
     }
 
     #[test]
@@ -473,12 +538,12 @@ mod tests {
         assert_eq!(lines[0], "Child sessions › task second");
         assert!(lines[2].contains("task grandchild"));
 
-        navigator.handle(Key::Back, &child, &frame);
+        navigator.handle(Key::Escape, &child, &frame);
         assert_eq!(navigator.current(), None);
         let lines = plain(&navigator.render(&root, 60, 10));
         assert!(lines[3].starts_with("› "));
 
-        assert_eq!(navigator.handle(Key::Back, &root, &frame), Outcome::Close);
+        assert_eq!(navigator.handle(Key::Escape, &root, &frame), Outcome::Close);
         assert_eq!(navigator.handle(Key::Open, &root, &frame), Outcome::Close);
     }
 

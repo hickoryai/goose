@@ -2,7 +2,6 @@ use crate::session::builder::ExtensionFailure;
 use anstream::{adapter::strip_str, eprintln};
 use bat::WrappingMode;
 use console::{measure_text_width, style, Color, StyledObject, Term};
-use goose::agents::platform_extensions::todo::TODO_WRITE_TOOL_NAME_COMPLETE;
 use goose::config::Config;
 use goose::conversation::message::{
     ActionRequiredData, Message, MessageContent, SystemNotificationContent, SystemNotificationType,
@@ -31,18 +30,40 @@ pub const DEFAULT_CLI_DARK_THEME: &str = "zenburn";
 const OUTPUT_TOKEN_LIMIT_WARNING: &str =
     "Warning: Response reached the model's output-token limit and may be incomplete.";
 
-thread_local! {
-    static CAPTURED: RefCell<Option<String>> = const { RefCell::new(None) };
+/// Output collected by `capture_output`, and whether the output it continues ended a line.
+struct Capture {
+    text: String,
+    line_start: bool,
 }
+
+thread_local! {
+    static CAPTURED: RefCell<Option<Capture>> = const { RefCell::new(None) };
+}
+
+/// Whether what this module last wrote to stdout ended its line, so a tool-call line can
+/// start on a line of its own after streamed text that did not.
+static LINE_START: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Runs `render` with everything this module prints collected into a string instead of
 /// written to stdout, so output can be handed to something that owns the terminal (the
 /// line editor's external printer) without disturbing it.
 pub fn capture_output(render: impl FnOnce()) -> String {
-    let outer = CAPTURED.with(|captured| captured.replace(Some(String::new())));
+    capture_output_after(true, render)
+}
+
+/// `capture_output` for output that continues text which `line_start` says ended its line
+/// (or not).
+pub fn capture_output_after(line_start: bool, render: impl FnOnce()) -> String {
+    let outer = CAPTURED.with(|captured| {
+        captured.replace(Some(Capture {
+            text: String::new(),
+            line_start,
+        }))
+    });
     render();
     CAPTURED
         .with(|captured| captured.replace(outer))
+        .map(|capture| capture.text)
         .unwrap_or_default()
 }
 
@@ -50,17 +71,41 @@ fn is_capturing() -> bool {
     CAPTURED.with(|captured| captured.borrow().is_some())
 }
 
+/// Whether `text` ends a line; `None` when it prints nothing visible to tell.
+fn ends_line(text: &str) -> Option<bool> {
+    console::strip_ansi_codes(text)
+        .chars()
+        .last()
+        .map(|last| last == '\n')
+}
+
+/// Whether the next output starts at the beginning of a line.
+fn at_line_start() -> bool {
+    CAPTURED.with(|captured| match captured.borrow().as_ref() {
+        Some(capture) => ends_line(&capture.text).unwrap_or(capture.line_start),
+        None => LINE_START.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+/// Records that `text` went to stdout outside `emit` (bat's printer).
+fn note_written(text: &str) {
+    if let Some(ended) = ends_line(text) {
+        LINE_START.store(ended, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn emit(args: std::fmt::Arguments<'_>) {
-    let unwritten = CAPTURED.with(|captured| match captured.borrow_mut().as_mut() {
-        Some(buffer) => {
-            use std::fmt::Write as _;
-            let _ = buffer.write_fmt(args);
-            None
+    let text = args.to_string();
+    let printed = CAPTURED.with(|captured| match captured.borrow_mut().as_mut() {
+        Some(capture) => {
+            capture.text.push_str(&text);
+            false
         }
-        None => Some(args),
+        None => true,
     });
-    if let Some(args) = unwritten {
-        anstream::print!("{args}");
+    if printed {
+        anstream::print!("{text}");
+        note_written(&text);
     }
 }
 
@@ -292,7 +337,7 @@ pub fn show_extension_failures(failures: &[ExtensionFailure]) {
         eprintln!(
             "{}",
             style(format!(
-                "    Hint: ask goose to help debug the '{}' extension",
+                "    Hint: ask kory to help debug the '{}' extension",
                 failure.label
             ))
             .dim()
@@ -301,6 +346,11 @@ pub fn show_extension_failures(failures: &[ExtensionFailure]) {
 }
 
 pub fn run_status_hook(status: &str) {
+    match status {
+        "thinking" => LOCAL_BUSY.store(true, std::sync::atomic::Ordering::Relaxed),
+        "waiting" => LOCAL_BUSY.store(false, std::sync::atomic::Ordering::Relaxed),
+        _ => {}
+    }
     if let Ok(hook) = Config::global().get_param::<String>("GOOSE_STATUS_HOOK") {
         let status = status.to_string();
         std::thread::spawn(move || {
@@ -365,7 +415,11 @@ pub fn render_message(message: &Message, debug: bool) {
                     outln!("action_required(tool_confirmation_response): {}", id)
                 }
             },
-            MessageContent::Text(text) => print_markdown(&text.text, theme),
+            MessageContent::Text(text) => {
+                let mut buffer = MarkdownBuffer::new();
+                render_reply_text(&text.text, &mut buffer, theme);
+                flush_markdown_buffer(&mut buffer, theme);
+            }
             MessageContent::ToolRequest(req) => render_tool_request(req, theme, debug),
             MessageContent::ToolResponse(resp) => render_tool_response(resp, debug),
             MessageContent::Image(image) => {
@@ -419,6 +473,13 @@ pub fn render_message_streaming(
     if !message.is_user_visible() {
         return;
     }
+    // A message typed during the turn and handed to it, shown the way it was typed.
+    if message.metadata.steer && message.role == Role::User {
+        flush_markdown_buffer(buffer, get_theme());
+        outln!("\n{} {}", accent(">"), message.as_concat_text());
+        let _ = std::io::stdout().flush();
+        return;
+    }
     let message = message.user_visible_content();
     let theme = get_theme();
 
@@ -431,11 +492,7 @@ pub fn render_message_streaming(
         }
 
         match content {
-            MessageContent::Text(text) => {
-                if let Some(safe_content) = buffer.push(&text.text) {
-                    print_markdown(&safe_content, theme);
-                }
-            }
+            MessageContent::Text(text) => render_reply_text(&text.text, buffer, theme),
             MessageContent::ToolRequest(req) => {
                 flush_markdown_buffer(buffer, theme);
                 render_tool_request(req, theme, debug);
@@ -620,23 +677,144 @@ fn render_thinking_streaming(
     }
 }
 
+/// A tool call is one line of the transcript: `▸` and what the call does. Everything else
+/// about it (arguments, output, errors) is in the tool-call detail view (↑ from the prompt),
+/// and its output also prints under it with `/toggle` on.
 fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
     match &req.tool_call {
-        Ok(call) => match call.name.to_string().as_str() {
-            name if is_shell_tool_name(name) => render_shell_request(call, debug),
-            name if is_file_tool_name(name) => render_text_editor_request(call, debug),
-            "execute_typescript" | "execute_code" => render_execute_code_request(call, debug),
-            "delegate" => render_delegate_request(call, debug),
-            "subagent" => render_delegate_request(call, debug),
-            TODO_WRITE_TOOL_NAME_COMPLETE => render_todo_request(call, debug),
-            "load" => {}
-            _ => render_default_request(call, debug),
-        },
+        Ok(call) => {
+            let Some(summary) = tool_call_summary(call, debug) else {
+                return;
+            };
+            print_tool_call_line(&summary);
+            if debug {
+                print_params(&call.arguments, 1, debug);
+            }
+        }
         Err(e) => print_markdown(&e.to_string(), theme),
     }
 }
 
+/// The one line a tool call shows in the transcript (without its `▸`), or `None` for a call
+/// that shows nothing.
+pub(super) fn tool_call_summary(call: &CallToolRequestParams, debug: bool) -> Option<String> {
+    let name = call.name.as_ref();
+    let arg = |key: &str| {
+        call.arguments
+            .as_ref()
+            .and_then(|args| args.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    let with_detail = |label: String, detail: Option<String>| match detail {
+        Some(detail) => format!("{label} {detail}"),
+        None => label,
+    };
+    let summary = match name {
+        "load" => return None,
+        name if is_shell_tool_name(name) => {
+            with_detail(name.to_string(), arg("command").map(first_line))
+        }
+        name if is_file_tool_name(name) => with_detail(
+            name.to_string(),
+            arg("path").map(|path| shorten_path(path, debug)),
+        ),
+        "execute_javascript" | "execute_typescript" | "execute_code" => {
+            let count = call
+                .arguments
+                .as_ref()
+                .and_then(|args| args.get("tool_graph"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            match count {
+                0 => tool_display_name(name),
+                1 => "execute 1 tool call".to_string(),
+                n => format!("execute {n} tool calls"),
+            }
+        }
+        "delegate" | "subagent" => with_detail(
+            name.to_string(),
+            arg("source")
+                .or_else(|| arg("instructions"))
+                .map(first_line),
+        ),
+        _ => tool_display_name(name),
+    };
+    Some(sanitize_terminal_line(&summary))
+}
+
+fn first_line(text: &str) -> String {
+    text.trim().lines().next().unwrap_or_default().to_string()
+}
+
+/// `tool extension` for an extension's tool, else the name (an ACP agent's call title).
+fn tool_display_name(name: &str) -> String {
+    let parts = ToolNameParts::from(name);
+    match parts.extension_name {
+        Some(extension_name) => format!(
+            "{} {}",
+            parts.tool_name,
+            extension_display_name(extension_name)
+        ),
+        None => parts.tool_name.to_string(),
+    }
+}
+
+/// `  ▸ summary`, cut to the terminal's width so it stays one row.
+pub(super) fn tool_call_line(summary: &str, width: Option<usize>) -> String {
+    let line = format!("  ▸ {summary}");
+    match width {
+        Some(width) if width > 1 => console::truncate_str(&line, width - 1, "…").into_owned(),
+        _ => line,
+    }
+}
+
+/// One dim line on a line of its own: text streamed without a line end is ended first, so
+/// the call never joins the prose before it (and no blank line is added).
+fn print_tool_call_line(summary: &str) {
+    if !at_line_start() {
+        outln!();
+    }
+    let width = std::io::stdout()
+        .is_terminal()
+        .then(|| Term::stdout().size().1 as usize);
+    outln!("{}", style(tool_call_line(summary, width)).dim());
+}
+
+/// A session status line (e.g. `◼ shutdown · …`), dim and on a line of its own like a tool
+/// call.
+pub fn print_status_line(line: &str) {
+    if !at_line_start() {
+        outln!();
+    }
+    outln!("{}", style(sanitize_terminal_line(line)).dim());
+    let _ = std::io::stdout().flush();
+}
+
+/// Reply text, with each router-acp notice quoted in it shown as a tool-call line.
+fn render_reply_text(text: &str, buffer: &mut MarkdownBuffer, theme: Theme) {
+    for segment in super::router_notices::split(text) {
+        match segment {
+            super::router_notices::Segment::Text(text) => {
+                if let Some(safe_content) = buffer.push(&text) {
+                    print_markdown(&safe_content, theme);
+                }
+            }
+            super::router_notices::Segment::Notice(notice) => {
+                flush_markdown_buffer(buffer, theme);
+                print_tool_call_line(&sanitize_terminal_line(&super::router_notices::summary(
+                    &notice,
+                )));
+            }
+        }
+    }
+}
+
 fn render_tool_response(resp: &ToolResponse, debug: bool) {
+    // Output stays out of the transcript unless asked for; the detail view has all of it.
+    if !debug && !get_show_full_tool_output() && std::io::stdout().is_terminal() {
+        return;
+    }
     let config = Config::global();
 
     match &resp.tool_result {
@@ -889,164 +1067,6 @@ pub fn render_builtin_error(names: &str, error: &str) {
     outln!();
 }
 
-fn render_text_editor_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
-
-    if let Some(args) = &call.arguments {
-        if let Some(Value::String(path)) = args.get("path") {
-            outln!(
-                "    {} {}",
-                style("path").dim(),
-                style(shorten_path(path, debug)).dim()
-            );
-        }
-
-        if let Some(args) = &call.arguments {
-            let mut other_args = serde_json::Map::new();
-            for (k, v) in args {
-                if k != "path" {
-                    other_args.insert(k.clone(), v.clone());
-                }
-            }
-            if !other_args.is_empty() {
-                print_params(&Some(other_args), 1, debug);
-            }
-        }
-    }
-    outln!();
-}
-
-fn render_shell_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
-    print_params(&call.arguments, 1, debug);
-    outln!();
-}
-
-fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
-    let tool_graph = call
-        .arguments
-        .as_ref()
-        .and_then(|args| args.get("tool_graph"))
-        .and_then(Value::as_array)
-        .filter(|arr| !arr.is_empty());
-
-    let Some(tool_graph) = tool_graph else {
-        return render_default_request(call, debug);
-    };
-
-    let count = tool_graph.len();
-    let plural = if count == 1 { "" } else { "s" };
-    outln!();
-    outln!(
-        "  {} {} {} tool call{}",
-        style("▸").dim(),
-        style("execute").dim(),
-        style(count).dim(),
-        plural,
-    );
-
-    for (i, node) in tool_graph.iter().filter_map(Value::as_object).enumerate() {
-        let tool = node
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let desc = node
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let deps: Vec<_> = node
-            .get("depends_on")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_u64)
-            .map(|d| (d + 1).to_string())
-            .collect();
-        let deps_str = if deps.is_empty() {
-            String::new()
-        } else {
-            format!(" (uses {})", deps.join(", "))
-        };
-        outln!(
-            "    {}. {} {}{}",
-            style(i + 1).dim(),
-            style(tool).dim(),
-            style(desc).dim(),
-            style(deps_str).dim()
-        );
-    }
-
-    let code = call
-        .arguments
-        .as_ref()
-        .and_then(|args| args.get("code"))
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty());
-    if code.is_some_and(|_| debug) {
-        outln!("{}", code.unwrap_or_default());
-    }
-
-    outln!();
-}
-
-fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
-
-    if let Some(args) = &call.arguments {
-        if let Some(Value::String(source)) = args.get("source") {
-            outln!("    {} {}", style("source").dim(), style(source).dim());
-        }
-
-        if let Some(Value::String(instructions)) = args.get("instructions") {
-            let display = if instructions.len() > 100 && !debug {
-                safe_truncate(instructions, 100)
-            } else {
-                instructions.clone()
-            };
-            outln!(
-                "    {} {}",
-                style("instructions").dim(),
-                style(display).dim()
-            );
-        }
-
-        if let Some(Value::Object(params)) = args.get("parameters") {
-            outln!("    {}:", style("parameters").dim());
-            print_params(&Some(params.clone()), 2, debug);
-        }
-
-        let skip_keys = ["source", "instructions", "parameters"];
-        let mut other_args = serde_json::Map::new();
-        for (k, v) in args {
-            if !skip_keys.contains(&k.as_str()) {
-                other_args.insert(k.clone(), v.clone());
-            }
-        }
-        if !other_args.is_empty() {
-            print_params(&Some(other_args), 1, debug);
-        }
-    }
-
-    outln!();
-}
-
-fn render_todo_request(call: &CallToolRequestParams, _debug: bool) {
-    print_tool_header(call);
-
-    if let Some(args) = &call.arguments {
-        if let Some(Value::String(content)) = args.get("content") {
-            outln!("    {} {}", style("content").dim(), style(content).dim());
-        }
-    }
-    outln!();
-}
-
-fn render_default_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
-    print_params(&call.arguments, 1, debug);
-    outln!();
-}
-
 fn extension_display_name(name: &str) -> &str {
     match name {
         "code_execution" => "Code Mode",
@@ -1075,91 +1095,27 @@ pub fn render_subagent_tool_call(
     arguments: Option<&JsonObject>,
     debug: bool,
 ) {
-    if tool_name == "code_execution__execute_typescript" {
-        let tool_graph = arguments
+    let mut summary = format_subagent_tool_call_message(subagent_id, tool_name);
+    if matches!(
+        tool_name,
+        "execute_javascript"
+            | "code_execution__execute_javascript"
+            | "execute_typescript"
+            | "code_execution__execute_typescript"
+    ) {
+        let count = arguments
             .and_then(|args| args.get("tool_graph"))
             .and_then(Value::as_array)
-            .filter(|arr| !arr.is_empty());
-        if let Some(tool_graph) = tool_graph {
-            return render_subagent_tool_graph(subagent_id, tool_graph);
+            .map_or(0, Vec::len);
+        if count > 0 {
+            let plural = if count == 1 { "" } else { "s" };
+            summary = format!("{summary} · {count} tool call{plural}");
         }
     }
-    let tool_header = format!(
-        "  {} {}",
-        style("▸").dim(),
-        style(format_subagent_tool_call_message(subagent_id, tool_name)).dim(),
-    );
-    outln!();
-    outln!("{}", tool_header);
-    print_params(&arguments.cloned(), 1, debug);
-    outln!();
-}
-
-fn render_subagent_tool_graph(subagent_id: &str, tool_graph: &[Value]) {
-    let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
-    let count = tool_graph.len();
-    let plural = if count == 1 { "" } else { "s" };
-    outln!();
-    outln!(
-        "  {} {} {} {} tool call{}",
-        style("▸").dim(),
-        style(format!("[subagent:{}]", short_id)).dim(),
-        style("execute_typescript").dim(),
-        style(count).dim(),
-        plural,
-    );
-
-    for (i, node) in tool_graph.iter().filter_map(Value::as_object).enumerate() {
-        let tool = node
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let desc = node
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let deps: Vec<_> = node
-            .get("depends_on")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_u64)
-            .map(|d| (d + 1).to_string())
-            .collect();
-        let deps_str = if deps.is_empty() {
-            String::new()
-        } else {
-            format!(" (uses {})", deps.join(", "))
-        };
-        outln!(
-            "    {}. {} {}{}",
-            style(i + 1).dim(),
-            style(tool).dim(),
-            style(desc).dim(),
-            style(deps_str).dim()
-        );
+    print_tool_call_line(&sanitize_terminal_line(&summary));
+    if debug {
+        print_params(&arguments.cloned(), 1, debug);
     }
-    outln!();
-}
-
-// Helper functions
-
-fn print_tool_header(call: &CallToolRequestParams) {
-    let parts = ToolNameParts::from(call.name.as_ref());
-    let tool_header = match parts.extension_name {
-        Some(extension_name) => format!(
-            "  {} {} {}",
-            style("▸").dim(),
-            style(parts.tool_name).dim(),
-            style(extension_display_name(extension_name))
-                .magenta()
-                .dim(),
-        ),
-        None => format!("  {} {}", style("▸").dim(), style(parts.tool_name).dim()),
-    };
-    outln!();
-    outln!("  {}", style("─".repeat(40)).dim());
-    outln!("{}", tool_header);
 }
 
 // Respect NO_COLOR, as https://crates.io/crates/console already does
@@ -1213,6 +1169,7 @@ fn print_markdown_raw(content: &str, theme: Theme) {
             out!("{rendered}");
         } else {
             printer.print().unwrap();
+            note_written(content);
         }
     });
 }
@@ -1543,54 +1500,150 @@ pub fn display_session_info(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // ASCII art goose with session info on the right
+    // kory's seedling with the session info beside its leaves
+    let info = [
+        format!(
+            "{} {} {} {} {}",
+            style("●").green(),
+            style(status).dim(),
+            style("·").dim(),
+            style(provider).dim(),
+            style(&model_display).cyan(),
+        ),
+        match session_id {
+            Some(id) => format!(
+                "{} {}",
+                style(id).dim(),
+                style(format!("· {cwd_display}")).dim()
+            ),
+            None => style(cwd_display).dim().to_string(),
+        },
+        format!("{}", style("🌱 kory is ready").white()),
+    ];
+    // A wrapped info line would split the seedling, so each fits beside it.
+    let room = (console::Term::stdout().size().1 as usize)
+        .saturating_sub(2 + SEEDLING[0].len() + 3)
+        .max(10);
     outln!();
-    outln!(
-        "  {}  {} {} {} {} {}",
-        style("  __( O)>").white(),
-        style("●").green(),
-        style(status).dim(),
-        style("·").dim(),
-        style(provider).dim(),
-        style(&model_display).cyan(),
-    );
-
-    if let Some(id) = session_id {
-        outln!(
-            "  {}  {} {} {}",
-            style(r" \____)").white(),
-            style(" ").dim(),
-            style(id).dim(),
-            style(format!("· {}", cwd_display)).dim(),
-        );
-    } else {
-        outln!(
-            "  {}  {} {}",
-            style(r" \____)").white(),
-            style(" ").dim(),
-            style(format!("  {}", cwd_display)).dim(),
-        );
+    for (row, art) in seedling_rows().iter().enumerate() {
+        match row.checked_sub(1).and_then(|line| info.get(line)) {
+            Some(text) => outln!("  {art}   {}", console::truncate_str(text, room, "…")),
+            None => outln!("  {}", art.trim_end()),
+        }
     }
-    outln!(
-        "  {}  {}",
-        style("   L L").white(),
-        style("   goose is ready").white()
-    );
+}
+
+/// kory's seedling, two pixels per text cell: `l` leaf, `d` midrib, `s` stem.
+const SEEDLING: [&str; 14] = [
+    "                    ",
+    "              lllll ",
+    "            lllldd  ",
+    "  ddlll    lllddll  ",
+    "  llddll   lldlll   ",
+    "   lllddl lddlll    ",
+    "    lllldllllll     ",
+    "         s          ",
+    "         ss         ",
+    "         ss         ",
+    "         ss         ",
+    "         ss         ",
+    "         ss         ",
+    "         s          ",
+];
+
+/// The seedling as half-block text rows, in true color when the terminal takes color.
+fn seedling_rows() -> Vec<String> {
+    let color = console::colors_enabled();
+    let rgb = |pixel: u8| match pixel {
+        b'l' => Some((129, 199, 132)),
+        b'd' => Some((56, 142, 60)),
+        b's' => Some((67, 160, 71)),
+        _ => None,
+    };
+    SEEDLING
+        .chunks(2)
+        .map(|pair| {
+            let (top, bottom) = (pair[0].as_bytes(), pair[1].as_bytes());
+            top.iter()
+                .zip(bottom)
+                .map(|(&t, &b)| seedling_cell(rgb(t), rgb(b), color))
+                .collect()
+        })
+        .collect()
+}
+
+fn seedling_cell(top: Option<(u8, u8, u8)>, bottom: Option<(u8, u8, u8)>, color: bool) -> String {
+    let fg = |(r, g, b): (u8, u8, u8)| format!("\x1b[38;2;{r};{g};{b}m");
+    let (glyph, paint) = match (top, bottom) {
+        (None, None) => return " ".into(),
+        (Some(t), None) => ("▀", fg(t)),
+        (None, Some(b)) => ("▄", fg(b)),
+        (Some(t), Some(b)) if t == b => ("█", fg(t)),
+        (Some(t), Some((r, g, b))) => ("▀", format!("{}\x1b[48;2;{r};{g};{b}m", fg(t))),
+    };
+    if color {
+        format!("{paint}{glyph}\x1b[0m")
+    } else if top.is_some() && bottom.is_some() {
+        "█".into()
+    } else {
+        glyph.into()
+    }
+}
+
+/// Goose's own prompt is in flight (between the "thinking" and "waiting" status hooks).
+static LOCAL_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TITLE_TICKER: std::sync::Once = std::sync::Once::new();
+const TITLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The terminal title for one tick: the session's reported title (router-acp
+/// sends `<project> [<model>]`) or the directory name, behind a spinner while
+/// the session works and a sprout while it is idle.
+fn terminal_title(
+    activity: &goose::acp::session_activity::SessionActivity,
+    local_busy: bool,
+    dir_name: &str,
+    tick: usize,
+) -> String {
+    let title = activity.title.as_deref().unwrap_or(dir_name);
+    // Sanitize: strip control characters (ESC, BEL, etc.) to prevent terminal escape injection
+    let sanitized: String = title.chars().filter(|c| !c.is_control()).collect();
+    let glyph = if activity.busy || local_busy {
+        TITLE_SPINNER[tick % TITLE_SPINNER.len()]
+    } else {
+        "🌱"
+    };
+    format!("{glyph} {sanitized}")
 }
 
 fn set_terminal_title() {
-    if !std::io::stdout().is_terminal() {
+    if !std::io::stderr().is_terminal() {
         return;
     }
-    let dir_name = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_default();
-    // Sanitize: strip control characters (ESC, BEL, etc.) to prevent terminal escape injection
-    let sanitized: String = dir_name.chars().filter(|c| !c.is_control()).collect();
-    // OSC 0 sets the terminal window/tab title
-    out!("\x1b]0;🪿 {}\x07", sanitized);
-    let _ = std::io::stdout().flush();
+    TITLE_TICKER.call_once(|| {
+        let dir_name = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        std::thread::spawn(move || {
+            let mut shown = String::new();
+            for tick in 0usize.. {
+                let title = terminal_title(
+                    &goose::acp::session_activity::current(),
+                    LOCAL_BUSY.load(std::sync::atomic::Ordering::Relaxed),
+                    &dir_name,
+                    tick,
+                );
+                if title != shown {
+                    // OSC 0 sets the terminal window/tab title; one write keeps it whole.
+                    let mut err = std::io::stderr().lock();
+                    let _ = err.write_all(format!("\x1b]0;{title}\x07").as_bytes());
+                    let _ = err.flush();
+                    shown = title;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+        });
+    });
 }
 
 pub fn display_banner(banners: &[String]) {
@@ -1810,6 +1863,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_title_spins_while_busy_and_sprouts_when_idle() {
+        use goose::acp::session_activity::SessionActivity;
+        let idle = SessionActivity::default();
+        assert_eq!(terminal_title(&idle, false, "Chordzy", 3), "🌱 Chordzy");
+        let routed = SessionActivity {
+            title: Some("Chordzy [opus]\x1b".into()),
+            busy: true,
+        };
+        assert_eq!(terminal_title(&routed, false, "x", 0), "⠋ Chordzy [opus]");
+        assert_eq!(terminal_title(&routed, false, "x", 1), "⠙ Chordzy [opus]");
+        assert_eq!(terminal_title(&idle, true, "Chordzy", 2), "⠹ Chordzy");
+    }
+
+    #[test]
     fn terminal_line_sanitizer_removes_escape_sequences_and_controls() {
         assert_eq!(
             sanitize_terminal_line(
@@ -1836,9 +1903,9 @@ mod tests {
     #[test]
     fn tool_confirmation_shows_execute_code_and_graph() {
         let arguments = json!({
-            "code": "await developer.shell({ command: \"cat ~/.ssh/id_rsa\" });",
+            "code": "async function run() { return await tools.call(\"shell\", { command: \"cat ~/.ssh/id_rsa\" }); }",
             "tool_graph": [{
-                "tool": "developer/read",
+                "tool": "text_editor",
                 "description": "read package manifest",
                 "depends_on": []
             }]
@@ -1847,9 +1914,9 @@ mod tests {
         .unwrap()
         .clone();
 
-        let rendered = format_tool_confirmation("execute_typescript", &arguments);
+        let rendered = format_tool_confirmation("execute_javascript", &arguments);
 
-        assert!(rendered.contains("execute_typescript"));
+        assert!(rendered.contains("execute_javascript"));
         assert!(rendered.contains("read package manifest"));
         assert!(rendered.contains("cat ~/.ssh/id_rsa"));
     }
@@ -1998,6 +2065,134 @@ mod tests {
         assert!(!stderr.contains("\u{1b}P"));
     }
 
+    fn tool_call(name: &str, args: Value) -> CallToolRequestParams {
+        let call = CallToolRequestParams::new(name.to_string());
+        match args {
+            Value::Object(map) => call.with_arguments(map),
+            _ => call,
+        }
+    }
+
+    fn terminal_request(id: &str) -> Message {
+        Message::assistant().with_tool_request(id, Ok(tool_call("Terminal", Value::Null)))
+    }
+
+    fn stream(messages: &[Message]) -> String {
+        let printed = capture_output(|| {
+            let mut buffer = MarkdownBuffer::new();
+            let mut thinking = false;
+            for message in messages {
+                render_message_streaming(message, &mut buffer, &mut thinking, false);
+            }
+            flush_markdown_buffer(&mut buffer, Theme::Dark);
+        });
+        console::strip_ansi_codes(&printed).into_owned()
+    }
+
+    #[test]
+    fn a_tool_call_after_unterminated_prose_starts_its_own_line() {
+        let printed = stream(&[
+            Message::assistant().with_text(
+                "Now retrying the chord-spelling warm-up, which the memory guard deferred.",
+            ),
+            terminal_request("t1"),
+            terminal_request("t2"),
+        ]);
+        assert_eq!(
+            printed,
+            "Now retrying the chord-spelling warm-up, which the memory guard deferred.\n  ▸ Terminal\n  ▸ Terminal\n"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_after_a_finished_line_adds_no_blank_line() {
+        let printed = stream(&[
+            Message::assistant().with_text("Done.\n"),
+            terminal_request("t1"),
+        ]);
+        assert_eq!(printed, "Done.\n  ▸ Terminal\n");
+        // Output that continues text that did not end its line is ended first.
+        let continued = capture_output_after(false, || print_tool_call_line("Edit"));
+        assert_eq!(console::strip_ansi_codes(&continued), "\n  ▸ Edit\n");
+    }
+
+    #[test]
+    fn router_notices_print_as_plain_tool_call_lines() {
+        let notice = r#"router-acp · delegate_task → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · task Feature · planner → claude@07460b494a7f4c0b9474e2957345695f/opus[1m] · phase=implementation (pool: implementation_candidates + boost +3.00) · utility 3.63 = 0.84×quality 2.97→0.55 (Feature) + 0.16×quota (headroom 60%, cost rank 4) + pref 3.07 · tradeoff 3→1.6 (complexity-scaled) · "[router-acp planner role: implement-work] Policy identity...""#;
+        let printed = stream(&[
+            terminal_request("t0"),
+            Message::assistant().with_text(format!(
+                "> {notice}\n> **detail** that stays hidden\n\nOn it."
+            )),
+        ]);
+        assert_eq!(
+            printed,
+            "  ▸ Terminal\n  ▸ router-acp · delegate_task Feature · planner → opus\nOn it."
+        );
+    }
+
+    #[test]
+    fn a_tool_call_is_one_line_without_its_arguments() {
+        let printed = capture_output(|| {
+            render_tool_request(
+                &ToolRequest {
+                    id: "t1".into(),
+                    tool_call: Ok(tool_call(
+                        "Terminal",
+                        serde_json::json!({"command": "cargo test", "cwd": "/repo", "threadId": "x"}),
+                    )),
+                    metadata: None,
+                    tool_meta: None,
+                },
+                Theme::Dark,
+                false,
+            )
+        });
+        assert_eq!(console::strip_ansi_codes(&printed), "  ▸ Terminal\n");
+    }
+
+    #[test]
+    fn tool_call_lines_name_what_the_call_does() {
+        let summary = |name: &str, args: Value| tool_call_summary(&tool_call(name, args), false);
+        assert_eq!(
+            summary("cat .agents/skills/implement-all/SKILL.md", Value::Null).as_deref(),
+            Some("cat .agents/skills/implement-all/SKILL.md")
+        );
+        assert_eq!(
+            summary("shell", serde_json::json!({"command": "ls -la\necho hi"})).as_deref(),
+            Some("shell ls -la")
+        );
+        assert_eq!(
+            summary("developer__shell", Value::Null).as_deref(),
+            Some("shell developer")
+        );
+        assert_eq!(
+            summary(
+                "execute_code",
+                serde_json::json!({"tool_graph": [{"tool": "a"}, {"tool": "b"}]})
+            )
+            .as_deref(),
+            Some("execute 2 tool calls")
+        );
+        assert_eq!(summary("load", Value::Null), None);
+        // Control characters in a title cannot break the line.
+        assert_eq!(
+            summary("Guardian\x1b[2J Review\n", Value::Null).as_deref(),
+            Some("Guardian Review")
+        );
+    }
+
+    #[test]
+    fn tool_call_lines_fit_the_terminal_width() {
+        let line = tool_call_line(
+            "router-delegate__delegate_task mcp with a long tail",
+            Some(20),
+        );
+        assert!(console::measure_text_width(&line) <= 19, "{line:?}");
+        assert!(line.starts_with("  ▸ router"));
+        assert_eq!(tool_call_line("Terminal", None), "  ▸ Terminal");
+    }
+
     #[test]
     fn formats_subagent_tool_call_names() {
         assert_eq!(
@@ -2007,6 +2202,10 @@ mod tests {
         assert_eq!(
             format_subagent_tool_call_message("subagent_42", "developer__shell"),
             "[subagent:42] shell | developer"
+        );
+        assert_eq!(
+            format_subagent_tool_call_message("subagent_42", "code_execution__execute_javascript"),
+            "[subagent:42] execute_javascript | Code Mode"
         );
         assert_eq!(
             format_subagent_tool_call_message("subagent_42", "code_execution__execute_typescript"),

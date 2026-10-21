@@ -16,6 +16,7 @@ mod ops_llm;
 mod ops_maxturns;
 mod ops_project;
 pub(crate) mod ops_recipe;
+mod ops_remaining_tool_calls;
 mod ops_retry;
 mod ops_skills;
 mod ops_slash_command;
@@ -27,32 +28,11 @@ pub use ops_subagent::{subagent_states, SubagentState};
 mod ops_tool_approval;
 mod ops_tool_pair_compaction;
 mod ops_toolcalling;
-mod ops_unknown_tool;
 mod session;
 pub(crate) use session::run as run_goose;
 pub(crate) use session::session_start_message;
 mod tool_confirmation;
 mod usage;
-
-use std::collections::HashSet;
-
-use crate::conversation::message::{Message, MessageContent};
-
-/// Several operations answer parts of one tool batch in separate messages, so a
-/// tool tail alone does not mean the batch is complete.
-pub(super) fn awaits_tool_responses(messages: &[Message]) -> bool {
-    let answered: HashSet<&str> = messages
-        .iter()
-        .flat_map(Message::get_tool_response_ids)
-        .collect();
-    messages
-        .iter()
-        .flat_map(|message| &message.content)
-        .filter_map(MessageContent::as_tool_request)
-        .any(|request| {
-            !request.was_executed_externally() && !answered.contains(request.id.as_str())
-        })
-}
 
 #[cfg(test)]
 mod tests;
@@ -66,6 +46,7 @@ pub use goose_agent::operation::{
     not_applicable, trailing_error, yielded, yielded_with, ConversationEffect, Emitter, Inference,
     InferenceInput, MachineEffect, Operation, OperationResult, RunStatus, SlashCommand, StepResult,
 };
+pub(super) use goose_agent::subagent::SubagentOperation;
 pub(crate) use tool_confirmation::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
     persist_tool_confirmation_decision,
@@ -81,14 +62,14 @@ pub(super) use ops_llm::{GooseInferenceProvider, InferenceRunner};
 pub(super) use ops_maxturns::{MaxTurnsOperation, MAX_TURNS_MESSAGE};
 pub(super) use ops_project::ProjectOperation;
 pub(super) use ops_recipe::RecipeOperation;
+pub(super) use ops_remaining_tool_calls::RemainingToolCallsOperation;
 pub(super) use ops_retry::RetryOperation;
 pub(super) use ops_skills::SkillOperation;
 pub(super) use ops_slash_command::SlashCommandOperation;
 pub(super) use ops_status::StatusOperation;
 pub(super) use ops_steer::{SteerOperation, SteerQueue};
 pub(super) use ops_stop_hook::StopHookOperation;
-pub(super) use ops_subagent::{SubagentOperation, DELEGATED_META_KEY};
+pub(super) use ops_subagent::DELEGATED_META_KEY;
 pub(super) use ops_tool_approval::ToolApprovalOperation;
 pub(super) use ops_tool_pair_compaction::ToolPairCompactionOperation;
 pub(super) use ops_toolcalling::ToolExecutionOperation;
-pub(super) use ops_unknown_tool::UnknownToolOperation;

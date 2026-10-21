@@ -63,6 +63,29 @@ impl Drop for KeyListener {
     }
 }
 
+/// Keeps typed keys off the screen until the turn's key listener reads them: a message
+/// typed while the turn is still starting would otherwise echo into the output.
+pub struct EchoOff {
+    original: libc::termios,
+}
+
+impl EchoOff {
+    pub fn start() -> Option<Self> {
+        let fd = std::io::stdin().as_raw_fd();
+        let original = get_termios(fd).ok()?;
+        let mut quiet = original;
+        quiet.c_lflag &= !(libc::ICANON | libc::ECHO);
+        set_termios(fd, &quiet).ok()?;
+        Some(Self { original })
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        let _ = set_termios(std::io::stdin().as_raw_fd(), &self.original);
+    }
+}
+
 fn read_keys(fd: i32, stop: &AtomicBool, tx: &mpsc::UnboundedSender<Key>) {
     let mut parser = KeyParser::default();
     let mut buf = [0u8; 256];
@@ -113,6 +136,7 @@ pub struct Screen;
 
 impl Screen {
     pub fn enter() -> Self {
+        super::dock::suspend();
         write_raw(ENTER_SCREEN);
         Self
     }
@@ -139,6 +163,7 @@ impl Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         write_raw(LEAVE_SCREEN);
+        super::dock::resume();
     }
 }
 

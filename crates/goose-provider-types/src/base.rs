@@ -259,6 +259,12 @@ pub struct ModelInfo {
     pub input_token_cost: Option<f64>,
     /// Cost per token for output in USD (optional)
     pub output_token_cost: Option<f64>,
+    /// Cost per cached input token read in USD
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_token_cost: Option<f64>,
+    /// Cost per input token written to cache in USD
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_token_cost: Option<f64>,
     /// Currency for the costs (default: "$")
     pub currency: Option<String>,
     /// Whether this model supports cache control
@@ -284,6 +290,8 @@ impl ModelInfo {
             context_limit: None,
             input_token_cost: None,
             output_token_cost: None,
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: None,
             supports_cache_control: None,
             reasoning: false,
@@ -321,6 +329,8 @@ impl ModelInfo {
             context_limit: Some(context_limit),
             input_token_cost: Some(input_cost),
             output_token_cost: Some(output_cost),
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: Some("$".to_string()),
             supports_cache_control: None,
             reasoning: false,
@@ -372,6 +382,8 @@ pub fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> M
         context_limit: canonical.as_ref().map(|model| model.limit.context),
         input_token_cost: None,
         output_token_cost: None,
+        cache_read_token_cost: None,
+        cache_write_token_cost: None,
         currency: None,
         supports_cache_control: None,
         reasoning,
@@ -523,6 +535,25 @@ pub enum UnsolicitedUpdate {
     Message(Message),
     /// Everything sent so far is complete; later pieces never continue an earlier id.
     Settled,
+}
+
+/// A notification the provider's agent sent under an extension method (an ACP method name
+/// starting with `_`, e.g. router-acp's `_router/shutdown_progress`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtensionNotification {
+    pub method: String,
+    pub params: serde_json::Value,
+}
+
+/// What became of user guidance handed to a provider's running turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// The agent took the message into the turn it is running.
+    Injected,
+    /// The agent could not take it right now; it may at a later point in the turn.
+    Declined,
+    /// The provider's agent takes no guidance mid-turn; goose's own loop has to deliver it.
+    Unsupported,
 }
 
 /// Base trait for AI providers (OpenAI, Anthropic, etc)
@@ -699,6 +730,13 @@ pub trait Provider: MaybeSend + MaybeSync {
         false
     }
 
+    /// Tokens the provider's own agent reports holding in its context right now, for a
+    /// provider that manages its own context. Its per-turn `Usage` sums every model call in
+    /// the turn and so says nothing about how full the context is. `None` until reported.
+    fn context_tokens(&self) -> Option<usize> {
+        None
+    }
+
     fn uses_local_session_naming(&self) -> bool {
         self.manages_own_context()
     }
@@ -751,6 +789,33 @@ pub trait Provider: MaybeSend + MaybeSync {
     /// agent only ever speaks when prompted return `None`.
     fn subscribe_unsolicited(&self) -> Option<broadcast::Receiver<UnsolicitedUpdate>> {
         None
+    }
+
+    /// Subscribe to the extension notifications the provider's agent sends. Providers whose
+    /// agent has none return `None`.
+    fn subscribe_extension_notifications(
+        &self,
+    ) -> Option<broadcast::Receiver<ExtensionNotification>> {
+        None
+    }
+
+    /// Send an extension request (`_vendor/method`) about the active session to the
+    /// provider's agent and return its answer. `sessionId` is added to `params`.
+    async fn extension_request(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        Err(ProviderError::NotImplemented(format!(
+            "{} does not take {method}",
+            self.get_name()
+        )))
+    }
+
+    /// Hand user guidance to the turn the provider's own agent is running, without
+    /// interrupting it. Providers whose turns goose's loop drives return `Unsupported`.
+    async fn steer(&self, _text: &str) -> Result<SteerOutcome, ProviderError> {
+        Ok(SteerOutcome::Unsupported)
     }
 
     /// Forward a thinking-effort selection to the provider. Returns `Ok(true)`
@@ -1132,6 +1197,8 @@ mod tests {
             context_limit: Some(1000),
             input_token_cost: None,
             output_token_cost: None,
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: None,
             supports_cache_control: None,
             reasoning: false,
@@ -1148,6 +1215,8 @@ mod tests {
             context_limit: Some(1000),
             input_token_cost: None,
             output_token_cost: None,
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: None,
             supports_cache_control: None,
             reasoning: false,
@@ -1164,6 +1233,8 @@ mod tests {
             context_limit: Some(2000),
             input_token_cost: None,
             output_token_cost: None,
+            cache_read_token_cost: None,
+            cache_write_token_cost: None,
             currency: None,
             supports_cache_control: None,
             reasoning: false,

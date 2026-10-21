@@ -187,48 +187,11 @@ pub(crate) fn prepare_inference_tools(
 ) -> Vec<Tool> {
     #[cfg(feature = "code-mode")]
     if code_execution_active {
-        let disclosure_style =
-            crate::agents::platform_extensions::code_execution::get_tool_disclosure();
-
-        tools = tools
-            .into_iter()
-            .filter_map(|mut tool| match disclosure_style {
-                pctx_code_mode::config::ToolDisclosure::Catalog
-                | pctx_code_mode::config::ToolDisclosure::Filesystem => {
-                    // in catalog & filesystem styles, progressive search is handled
-                    // by pctx, so we want to omit all non-first-class extensions
-                    // from the standard tool list
-                    if crate::agents::extension_manager::get_tool_owner(&tool).is_some_and(
-                        |owner| crate::agents::extension_manager::is_first_class_extension(&owner),
-                    ) || crate::agents::extension_manager::get_tool_resource_uri(&tool).is_some()
-                    {
-                        Some(tool)
-                    } else {
-                        None
-                    }
-                }
-                pctx_code_mode::config::ToolDisclosure::Sidecar => {
-                    // in sidecar style there is no progressive search, just a way to chain tools
-                    // together with typescript
-                    // add output schema to description since many model providers drop the
-                    // output schema when presenting tools to the model
-                    let output_schema = tool
-                        .output_schema
-                        .as_ref()
-                        .map(|schema| serde_json::json!(schema).to_string())
-                        .unwrap_or("unknown".to_string());
-                    let description =
-                        format!("The successful return schema of this tool is:\n{output_schema}");
-                    tool.description = Some(
-                        tool.description
-                            .map(|current| format!("{current}\n{description}"))
-                            .unwrap_or(description)
-                            .into(),
-                    );
-                    Some(tool)
-                }
-            })
-            .collect();
+        tools.retain(|tool| {
+            crate::agents::extension_manager::get_tool_owner(tool).is_some_and(|owner| {
+                crate::agents::extension_manager::is_first_class_extension(&owner)
+            }) || crate::agents::extension_manager::get_tool_resource_uri(tool).is_some()
+        });
     }
 
     #[cfg(not(feature = "code-mode"))]
@@ -290,8 +253,15 @@ pub(crate) async fn stream_response_from_provider(
 ) -> Result<MessageStream, ProviderError> {
     let config = model_config.clone();
 
-    let projected_messages =
-        Conversation::new_unvalidated(messages.iter().cloned()).agent_visible_messages();
+    // ACP cannot discard internal tool instructions after role merging folds
+    // them into the user's request and loses their turn-context marker.
+    let projected_messages = Conversation::new_unvalidated(
+        messages
+            .iter()
+            .filter(|message| !provider.manages_own_context() || !message.is_turn_context())
+            .cloned(),
+    )
+    .agent_visible_messages();
     let (filtered_messages, _) =
         fix_conversation(Conversation::new_unvalidated(projected_messages));
     let filtered_messages = Conversation::new_unvalidated(merge_consecutive_messages_for_request(
@@ -609,12 +579,17 @@ mod tests {
     #[derive(Clone)]
     struct CapturingProvider {
         messages: Arc<Mutex<Vec<Message>>>,
+        owns_context: bool,
     }
 
     #[async_trait]
     impl Provider for CapturingProvider {
         fn get_name(&self) -> &str {
             "capturing"
+        }
+
+        fn manages_own_context(&self) -> bool {
+            self.owns_context
         }
 
         async fn stream(
@@ -628,6 +603,43 @@ mod tests {
             let message = Message::assistant().with_text("ok");
             let usage = ProviderUsage::new("capturing".to_string(), Usage::default());
             Ok(stream_from_single_message(message, usage))
+        }
+    }
+
+    #[tokio::test]
+    async fn native_agent_provider_filters_turn_context_before_merging() {
+        use crate::conversation::message::MessageMetadata;
+
+        for owns_context in [false, true] {
+            let messages = vec![
+                Message::user().with_text("implement"),
+                Message::user()
+                    .with_text("<turn-context>Use execute_typescript only</turn-context>")
+                    .with_metadata(MessageMetadata::agent_only().with_turn_context()),
+            ];
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(CapturingProvider {
+                messages: captured.clone(),
+                owns_context,
+            });
+            let _stream = stream_response_from_provider(
+                provider,
+                ModelConfig::new("test-model"),
+                "test-session",
+                "system",
+                &messages,
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert!(captured[0].as_concat_text().contains("implement"));
+            assert_eq!(
+                captured[0].as_concat_text().contains("execute_typescript"),
+                !owns_context
+            );
         }
     }
 
@@ -690,6 +702,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(CapturingProvider {
             messages: captured.clone(),
+            owns_context: false,
         });
 
         let _stream = stream_response_from_provider(
@@ -722,6 +735,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(CapturingProvider {
             messages: captured.clone(),
+            owns_context: false,
         });
 
         let _stream = stream_response_from_provider(
@@ -766,6 +780,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(CapturingProvider {
             messages: captured.clone(),
+            owns_context: false,
         });
 
         let _stream = stream_response_from_provider(
@@ -1489,6 +1504,27 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
+    }
+    #[cfg(feature = "code-mode")]
+    #[test]
+    fn code_mode_keeps_first_class_and_resource_tools() {
+        let mut first_class =
+            make_tool_with_meta(Some(serde_json::json!({"goose_extension": "developer"})));
+        first_class.name = "shell".into();
+        let mut resource = make_tool_with_meta(Some(
+            serde_json::json!({"ui": {"resourceUri": "ui://example"}}),
+        ));
+        resource.name = "resource__view".into();
+        let ordinary = make_tool_with_meta(None);
+        let hidden = make_tool_with_meta(Some(
+            serde_json::json!({"goose_extension": "developer", "ui": {"visibility": ["app"]}}),
+        ));
+        let filtered = prepare_inference_tools(vec![ordinary, first_class, resource, hidden], true);
+        let names = filtered
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["resource__view", "shell"]);
     }
 }
 

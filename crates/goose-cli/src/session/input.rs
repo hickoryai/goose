@@ -16,6 +16,7 @@ use strum::VariantNames;
 pub enum InputResult {
     Message(String),
     Exit,
+    Interrupt,
     AddExtension(String),
     AddBuiltin(String),
     ToggleTheme,
@@ -29,6 +30,12 @@ pub enum InputResult {
     New,
     Compact,
     Children,
+    /// `/shutdown`: save an `/implement` run's resume state and drain its workers.
+    Shutdown,
+    /// ↓ on an empty prompt: move into the child dock.
+    DockFocus,
+    /// ↑ on an empty prompt: move into the session's tool calls.
+    ToolFocus,
     ToggleFullToolOutput,
     Edit(Option<String>),
     ListSkills,
@@ -71,9 +78,16 @@ impl rustyline::ConditionalEventHandler for CtrlCHandler {
             // Clear the line if there's text
             let mut cache = self.completion_cache.write().unwrap();
             cache.hint_status = HintStatus::Default;
+            if let Some(guard) = cache.planner_quit.as_mut() {
+                *guard = Default::default();
+            }
             Some(rustyline::Cmd::Kill(rustyline::Movement::WholeBuffer))
         } else {
             let mut cache = self.completion_cache.write().unwrap();
+
+            if cache.planner_quit.is_some() {
+                return Some(rustyline::Cmd::Interrupt);
+            }
 
             if cache.hint_status == HintStatus::MaybeExit {
                 return Some(rustyline::Cmd::Interrupt);
@@ -84,6 +98,161 @@ impl rustyline::ConditionalEventHandler for CtrlCHandler {
 
             Some(rustyline::Cmd::Repaint)
         }
+    }
+}
+
+/// ↓ on an empty line moves into the child dock when it lists children; otherwise ↓ keeps
+/// its history meaning.
+struct DockFocusHandler;
+
+impl rustyline::ConditionalEventHandler for DockFocusHandler {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: u16,
+        _positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        (ctx.line().is_empty() && super::child_sessions::dock::request_focus())
+            .then_some(rustyline::Cmd::AcceptLine)
+    }
+}
+
+/// ↑ on an empty line moves into the session's tool calls when it has any; otherwise ↑ keeps
+/// its history meaning (as does Ctrl+P, always).
+struct ToolFocusHandler;
+
+impl rustyline::ConditionalEventHandler for ToolFocusHandler {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: u16,
+        _positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        (ctx.line().is_empty() && super::tool_calls::request_focus())
+            .then_some(rustyline::Cmd::AcceptLine)
+    }
+}
+
+/// How long after an unparsed escape sequence its leftover bytes may still arrive. The
+/// terminal writes a key report in one go, so its tail is already buffered.
+const ESCAPE_TAIL_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// rustyline stops parsing an extended key report it does not know partway through — xterm's
+/// modifyOtherKeys Ctrl+Enter, `ESC[27;5;13~`, ends after `ESC[27;5;` — and the rest (`13~`)
+/// would be typed into the prompt. This swallows such a tail and acts on the key it names.
+#[derive(Default)]
+struct EscapeTail {
+    started: Option<std::time::Instant>,
+    params: String,
+}
+
+#[derive(Debug, PartialEq)]
+enum TailStep {
+    /// Part of the tail: drop it.
+    Swallow,
+    /// The tail's last byte: what the reported key does, if anything.
+    Done(Option<rustyline::Cmd>),
+    /// Not a tail: an ordinary key.
+    NotTail,
+}
+
+impl EscapeTail {
+    fn start(&mut self, now: std::time::Instant) {
+        self.started = Some(now);
+        self.params.clear();
+    }
+
+    fn step(&mut self, c: char, now: std::time::Instant) -> TailStep {
+        let Some(started) = self.started else {
+            return TailStep::NotTail;
+        };
+        if now.saturating_duration_since(started) > ESCAPE_TAIL_WINDOW {
+            self.started = None;
+            return TailStep::NotTail;
+        }
+        match c {
+            '0'..='9' | ';' | ':' => {
+                self.params.push(c);
+                TailStep::Swallow
+            }
+            // modifyOtherKeys: what is left is the key's code.
+            '~' => {
+                self.started = None;
+                let code = self.params.rsplit(';').next().and_then(|c| c.parse().ok());
+                TailStep::Done(code.and_then(key_code_command))
+            }
+            // kitty's `code;mods u`: only modifiers are left, the key is unknown.
+            'u' => {
+                self.started = None;
+                TailStep::Done(None)
+            }
+            _ => {
+                self.started = None;
+                TailStep::NotTail
+            }
+        }
+    }
+}
+
+/// The command for a key reported by code with modifiers rustyline already consumed.
+/// Ctrl+Enter sends, as it does during a turn (where it also interrupts the turn).
+fn key_code_command(code: u32) -> Option<rustyline::Cmd> {
+    match code {
+        13 => Some(rustyline::Cmd::AcceptLine),
+        _ => char::from_u32(code)
+            .filter(|c| !c.is_control())
+            .map(|c| rustyline::Cmd::SelfInsert(1, c)),
+    }
+}
+
+/// An escape sequence rustyline could not parse: its tail may follow.
+struct UnknownEscapeHandler {
+    tail: Arc<std::sync::Mutex<EscapeTail>>,
+}
+
+impl rustyline::ConditionalEventHandler for UnknownEscapeHandler {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: u16,
+        _positive: bool,
+        _ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        self.tail.lock().unwrap().start(std::time::Instant::now());
+        Some(rustyline::Cmd::Noop)
+    }
+}
+
+/// Every key without a binding of its own: the tail of an unparsed escape sequence is
+/// swallowed, anything else goes to paste capture.
+struct AnyKeyHandler {
+    tail: Arc<std::sync::Mutex<EscapeTail>>,
+    paste: PasteCaptureHandler,
+}
+
+impl rustyline::ConditionalEventHandler for AnyKeyHandler {
+    fn handle(
+        &self,
+        event: &rustyline::Event,
+        n: u16,
+        positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        if let Some(rustyline::KeyEvent(rustyline::KeyCode::Char(c), _)) = event.get(0) {
+            match self
+                .tail
+                .lock()
+                .unwrap()
+                .step(*c, std::time::Instant::now())
+            {
+                TailStep::Swallow => return Some(rustyline::Cmd::Noop),
+                TailStep::Done(cmd) => return Some(cmd.unwrap_or(rustyline::Cmd::Noop)),
+                TailStep::NotTail => {}
+            }
+        }
+        self.paste.handle(event, n, positive, ctx)
     }
 }
 
@@ -149,11 +318,26 @@ pub fn get_input(
 
     let paste_state = Arc::new(std::sync::RwLock::new(PasteState::default()));
 
+    let escape_tail = Arc::new(std::sync::Mutex::new(EscapeTail::default()));
     editor.bind_sequence(
         rustyline::Event::Any,
-        rustyline::EventHandler::Conditional(Box::new(PasteCaptureHandler::new(
-            paste_state.clone(),
-        ))),
+        rustyline::EventHandler::Conditional(Box::new(AnyKeyHandler {
+            tail: escape_tail.clone(),
+            paste: PasteCaptureHandler::new(paste_state.clone()),
+        })),
+    );
+
+    editor.bind_sequence(
+        rustyline::KeyEvent(
+            rustyline::KeyCode::UnknownEscSeq,
+            rustyline::Modifiers::NONE,
+        ),
+        rustyline::EventHandler::Conditional(Box::new(UnknownEscapeHandler { tail: escape_tail })),
+    );
+
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Up, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(ToolFocusHandler)),
     );
 
     editor.bind_sequence(
@@ -183,6 +367,11 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Down, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(DockFocusHandler)),
+    );
+
     // Background agent output prints above the line being edited only while it is edited.
     if let Some(relay) = background_output {
         relay.resume();
@@ -191,10 +380,16 @@ pub fn get_input(
     if let Some(relay) = background_output {
         relay.pause();
     }
+    if super::child_sessions::dock::take_focus_request() {
+        return Ok(InputResult::DockFocus);
+    }
+    if super::tool_calls::take_focus_request() {
+        return Ok(InputResult::ToolFocus);
+    }
     let input = match read {
         Ok(text) => text,
         Err(e) => match e {
-            rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
+            rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Interrupt),
             rustyline::error::ReadlineError::Eof => return Ok(InputResult::Exit),
             _ => return Err(e.into()),
         },
@@ -337,6 +532,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_NEW => Some(InputResult::New),
         s if s == CMD_COMPACT => Some(InputResult::Compact),
         s if s == CMD_CHILDREN => Some(InputResult::Children),
+        "/shutdown" => Some(InputResult::Shutdown),
         // Match "/skills" exactly or "/skills " with args - avoids matching e.g. "/skillsextra"
         s if s == CMD_SKILLS || s.starts_with(&format!("{CMD_SKILLS} ")) => {
             let args = s.get(CMD_SKILLS.len()..).unwrap_or("").trim();
@@ -453,12 +649,16 @@ fn help_text() -> String {
 /clear - Clears the current chat history
 /new - Start a fresh session in this process, keeping the current provider, model and extensions
 /children - Browse this session's subagent sessions (read-only)
+/shutdown - In an /implement session: save the run's resume state, drain its workers, and end
+            the session gracefully; /implement in a new session resumes (also mid-turn)
 
 Navigation:
-Enter - Send message
+Enter or Ctrl+Enter - Send message (during a turn: Enter queues it, Ctrl+Enter interrupts and sends)
 Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
 Ctrl+C - Clear current line if text is entered, otherwise exit the session
-Up/Down arrows - Navigate through command history
+Up on an empty prompt - Select the session's tool calls (Up/Down move, Enter shows one, Esc returns)
+Ctrl+P/Ctrl+N - Navigate through command history (also Up/Down while the prompt has text)
+Down on an empty prompt - Select a running child session in the dock
 Tab (while subagents run) - Open the read-only child session navigator; Tab, q or Esc closes it
 GOOSE_CLI_BELL=true - Ring the terminal bell when goose finishes a turn or needs approval"
     )
@@ -508,6 +708,79 @@ fn print_editor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn feed_tail(tail: &mut EscapeTail, text: &str, at: std::time::Instant) -> Vec<TailStep> {
+        text.chars().map(|c| tail.step(c, at)).collect()
+    }
+
+    #[test]
+    fn shutdown_is_a_command() {
+        assert!(matches!(
+            handle_slash_command("/shutdown"),
+            Some(InputResult::Shutdown)
+        ));
+        assert!(matches!(
+            handle_slash_command("  /shutdown  "),
+            Some(InputResult::Shutdown)
+        ));
+        assert!(help_text().contains("/shutdown"));
+    }
+
+    #[test]
+    fn ctrl_enter_tail_left_by_rustyline_sends_instead_of_typing() {
+        // rustyline reads `ESC[27;5;` of `ESC[27;5;13~` and reports an unknown sequence.
+        let now = std::time::Instant::now();
+        let mut tail = EscapeTail::default();
+        tail.start(now);
+        assert_eq!(
+            feed_tail(&mut tail, "13~", now),
+            [
+                TailStep::Swallow,
+                TailStep::Swallow,
+                TailStep::Done(Some(rustyline::Cmd::AcceptLine))
+            ]
+        );
+        // Typing afterwards is ordinary input again.
+        assert_eq!(tail.step('1', now), TailStep::NotTail);
+    }
+
+    #[test]
+    fn escape_tails_never_leak_into_the_prompt() {
+        let now = std::time::Instant::now();
+        let mut tail = EscapeTail::default();
+        // modifyOtherKeys Shift+A (`ESC[27;2;65~`) types the character it names.
+        tail.start(now);
+        assert_eq!(
+            feed_tail(&mut tail, "65~", now).pop(),
+            Some(TailStep::Done(Some(rustyline::Cmd::SelfInsert(1, 'A'))))
+        );
+        // kitty `ESC[106;5u` loses `ESC[106;` to rustyline: `5u` is swallowed.
+        tail.start(now);
+        assert_eq!(
+            feed_tail(&mut tail, "5u", now),
+            [TailStep::Swallow, TailStep::Done(None)]
+        );
+        // A control code (Ctrl+Escape) does nothing.
+        tail.start(now);
+        assert_eq!(
+            feed_tail(&mut tail, "27~", now).pop(),
+            Some(TailStep::Done(None))
+        );
+    }
+
+    #[test]
+    fn keys_typed_after_a_complete_unknown_sequence_are_kept() {
+        let now = std::time::Instant::now();
+        let mut tail = EscapeTail::default();
+        // `ESC[13;5u` is consumed whole; digits typed later are the user's.
+        tail.start(now);
+        let later = now + ESCAPE_TAIL_WINDOW * 2;
+        assert_eq!(tail.step('4', later), TailStep::NotTail);
+        // A letter ends a tail at once.
+        tail.start(now);
+        assert_eq!(tail.step('x', now), TailStep::NotTail);
+        assert_eq!(EscapeTail::default().step('7', now), TailStep::NotTail);
+    }
 
     #[test]
     fn test_handle_slash_command() {

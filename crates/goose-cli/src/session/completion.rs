@@ -528,9 +528,12 @@ impl Hinter for GooseCompleter {
 
         match cache.hint_status {
             HintStatus::Interrupted => {
-                Some("Interrupted, what should goose work on instead?".to_string())
+                Some("Interrupted, what should kory work on instead?".to_string())
             }
             HintStatus::MaybeExit => {
+                if cache.planner_quit.is_some() {
+                    return Some(super::shutdown::QUIT_CONFIRM.to_string());
+                }
                 Some("Press Ctrl+C again to exit, or type new instructions to continue".to_string())
             }
             HintStatus::Default => {
