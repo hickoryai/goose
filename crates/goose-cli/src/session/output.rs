@@ -346,6 +346,11 @@ pub fn show_extension_failures(failures: &[ExtensionFailure]) {
 }
 
 pub fn run_status_hook(status: &str) {
+    match status {
+        "thinking" => LOCAL_BUSY.store(true, std::sync::atomic::Ordering::Relaxed),
+        "waiting" => LOCAL_BUSY.store(false, std::sync::atomic::Ordering::Relaxed),
+        _ => {}
+    }
     if let Ok(hook) = Config::global().get_param::<String>("GOOSE_STATUS_HOOK") {
         let status = status.to_string();
         std::thread::spawn(move || {
@@ -1585,19 +1590,60 @@ fn seedling_cell(top: Option<(u8, u8, u8)>, bottom: Option<(u8, u8, u8)>, color:
     }
 }
 
+/// Goose's own prompt is in flight (between the "thinking" and "waiting" status hooks).
+static LOCAL_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TITLE_TICKER: std::sync::Once = std::sync::Once::new();
+const TITLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The terminal title for one tick: the session's reported title (router-acp
+/// sends `<project> [<model>]`) or the directory name, behind a spinner while
+/// the session works and a sprout while it is idle.
+fn terminal_title(
+    activity: &goose::acp::session_activity::SessionActivity,
+    local_busy: bool,
+    dir_name: &str,
+    tick: usize,
+) -> String {
+    let title = activity.title.as_deref().unwrap_or(dir_name);
+    // Sanitize: strip control characters (ESC, BEL, etc.) to prevent terminal escape injection
+    let sanitized: String = title.chars().filter(|c| !c.is_control()).collect();
+    let glyph = if activity.busy || local_busy {
+        TITLE_SPINNER[tick % TITLE_SPINNER.len()]
+    } else {
+        "🌱"
+    };
+    format!("{glyph} {sanitized}")
+}
+
 fn set_terminal_title() {
-    if !std::io::stdout().is_terminal() {
+    if !std::io::stderr().is_terminal() {
         return;
     }
-    let dir_name = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_default();
-    // Sanitize: strip control characters (ESC, BEL, etc.) to prevent terminal escape injection
-    let sanitized: String = dir_name.chars().filter(|c| !c.is_control()).collect();
-    // OSC 0 sets the terminal window/tab title
-    out!("\x1b]0;🌱 {}\x07", sanitized);
-    let _ = std::io::stdout().flush();
+    TITLE_TICKER.call_once(|| {
+        let dir_name = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        std::thread::spawn(move || {
+            let mut shown = String::new();
+            for tick in 0usize.. {
+                let title = terminal_title(
+                    &goose::acp::session_activity::current(),
+                    LOCAL_BUSY.load(std::sync::atomic::Ordering::Relaxed),
+                    &dir_name,
+                    tick,
+                );
+                if title != shown {
+                    // OSC 0 sets the terminal window/tab title; one write keeps it whole.
+                    let mut err = std::io::stderr().lock();
+                    let _ = err.write_all(format!("\x1b]0;{title}\x07").as_bytes());
+                    let _ = err.flush();
+                    shown = title;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+        });
+    });
 }
 
 pub fn display_banner(banners: &[String]) {
@@ -1814,6 +1860,20 @@ mod tests {
         }
 
         assert_eq!(rendered, "two\n  three\n  four");
+    }
+
+    #[test]
+    fn terminal_title_spins_while_busy_and_sprouts_when_idle() {
+        use goose::acp::session_activity::SessionActivity;
+        let idle = SessionActivity::default();
+        assert_eq!(terminal_title(&idle, false, "Chordzy", 3), "🌱 Chordzy");
+        let routed = SessionActivity {
+            title: Some("Chordzy [opus]\x1b".into()),
+            busy: true,
+        };
+        assert_eq!(terminal_title(&routed, false, "x", 0), "⠋ Chordzy [opus]");
+        assert_eq!(terminal_title(&routed, false, "x", 1), "⠙ Chordzy [opus]");
+        assert_eq!(terminal_title(&idle, true, "Chordzy", 2), "⠹ Chordzy");
     }
 
     #[test]

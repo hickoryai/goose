@@ -1496,6 +1496,18 @@ impl AcpClientLoop {
                                 context_size.store(usage.size, Ordering::Relaxed);
                                 context_used.store(usage.used.saturating_add(1), Ordering::Relaxed);
                             }
+                            SessionUpdate::SessionInfoUpdate(update) => {
+                                let busy = update
+                                    .meta
+                                    .as_ref()
+                                    .and_then(|meta| meta.get("routerAcp"))
+                                    .and_then(|router| router.get("busy"))
+                                    .and_then(|busy| busy.as_bool());
+                                super::session_activity::update(
+                                    update.title.value().cloned(),
+                                    busy,
+                                );
+                            }
                             _ => {}
                         }
                         // With no goose prompt in flight the agent is running a turn of its
